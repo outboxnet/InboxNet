@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>InboxNet.Inbox.Providers</RootNamespace>
+    <Description>Built-in webhook providers for the InboxNet inbox — Stripe, GitHub, and generic HMAC</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\InboxNet.Inbox.Core\InboxNet.Inbox.Core.csproj" />
+  </ItemGroup>
+</Project>
