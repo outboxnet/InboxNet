@@ -1,553 +1,354 @@
-# InboxNet — Software Architecture Document
+# InboxNet — Architecture
 
-## 1. Why InboxNet Exists
+## 1. What InboxNet Solves
 
-### The Fundamental Problem: Reliable Cross-System Communication
+Receiving webhooks reliably is harder than it looks. The naive implementation — validate the signature, do business logic, return 200 — has three failure modes that appear only under production traffic:
 
-Every non-trivial application eventually needs to do two things at once: **save data** and **tell someone about it**. An e-commerce system saves an order, then notifies the payment service. A SaaS platform creates a user, then fires a webhook to the tenant's endpoint. A logistics system marks a shipment dispatched, then alerts the tracking service.
+| Failure | Consequence |
+|---|---|
+| Handler throws after you return 200 | Event lost permanently — provider will not retry |
+| Handler throws before you return 200 | Provider retries, handler runs twice with no dedup |
+| Process restarts mid-handler | No record of what happened; event may be lost or re-processed |
 
-These two operations — the database write and the network call — live in different failure domains. The database is local, fast, and transactional. The network call is remote, unpredictable, and can fail in ways that leave the caller unsure whether the receiver actually got the message.
+InboxNet eliminates these by separating *receiving* from *processing*:
 
-This is called the **dual-write problem**, and it is the single most common source of data inconsistency in distributed systems.
+1. **Receive**: validate signature, persist to `InboxMessages` (with dedup), return 202
+2. **Process**: background dispatcher locks messages, runs handlers, retries failures, dead-letters exhausted messages
 
-### What Goes Wrong Without a Solution
-
-Consider a simple order placement:
-
-```
-SaveOrder()          →  succeeds
-SendPaymentWebhook() →  ???
-```
-
-Every possible failure mode produces a different kind of damage:
-
-| Failure | Outcome | Business impact |
-|---------|---------|-----------------|
-| App crashes after DB write, before webhook | Order exists, payment never initiated | Revenue loss, stuck order |
-| Webhook times out after 30s | Did receiver get it? Unknown | Potential double-charge or no charge |
-| DB write succeeds, webhook returns 500 | Order exists, payment service rejected | Inconsistent state across services |
-| App sends webhook, DB commit fails | Payment initiated for non-existent order | Phantom transaction, refund needed |
-| Two webhooks needed (payment + inventory), one fails | One downstream updated, one not | Partial state — inventory reserved but no payment, or payment but no inventory |
-
-These are not theoretical. In production systems processing hundreds of requests per second, network partitions, timeouts, and crashes happen **daily**. A fire-and-forget HTTP call after a database write is not a design choice — it is a bug waiting for production traffic to expose it.
-
-### Why Naive Fixes Fail
-
-**"Just wrap it in a try/catch and retry."** Retries introduce duplicate delivery. The receiver may have processed the first attempt but the response was lost. Now the payment is charged twice.
-
-**"Use a distributed transaction."** Two-phase commit (2PC) requires both the database and the receiver to support the XA protocol. HTTP webhooks don't. Even when both sides support it, 2PC couples the availability of unrelated services — if the payment system is down, orders can't be placed.
-
-**"Send the webhook first, then save to DB."** If the DB write fails, the receiver has a payment for an order that doesn't exist. This is worse than the original problem.
-
-**"Use a message broker."** If the app writes to the database and then publishes to RabbitMQ/Kafka, you still have the dual-write problem — just between the database and the broker instead of between the database and the webhook. The broker doesn't participate in the DB transaction.
-
-### The Correct Solution: Transactional Outbox Pattern
-
-The only way to atomically couple a database write with a notification is to make the notification **part of the database write**. Instead of sending a webhook after the commit, you write a message to an outbox table **inside the same transaction**. A separate background process picks up outbox messages and delivers them.
-
-```
-BEGIN TRANSACTION
-    INSERT INTO Orders (...)
-    INSERT INTO OutboxMessages (EventType='order.placed', Payload='{...}')
-COMMIT
-```
-
-If the transaction commits, the message is guaranteed to exist. If it rolls back, the message disappears with the order. There is no window where one exists without the other.
-
-A background processor then reads the outbox, delivers webhooks, records delivery attempts, retries failures, and dead-letters messages that exhaust retries.
-
-**InboxNet implements this pattern as a modular .NET library**, providing the transactional publish, background processing, webhook delivery, retry policies, observability, and persistence — so application developers don't have to build, test, and maintain this critical infrastructure themselves.
+The inbox table is in the same SQL Server database as your domain data. This means the acknowledgement (returning 202) and the durability guarantee (the row in the DB) are the same atomic operation. A crash before the INSERT never returns 202. A crash after the INSERT leaves a row the dispatcher will pick up.
 
 ---
 
-## 2. Architecture Overview
-
-### System Context
+## 2. Request Flow
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              Host Application                                │
-│                                                                              │
-│  ┌────────────────┐         ┌───────────────────┐        ┌──────────────┐   │
-│  │  Domain Logic   │────────▶│  IOutboxPublisher  │───────▶│  SQL Server   │   │
-│  │                 │  same   │  (transactional)   │  same  │  ┌─────────┐│   │
-│  │  Order.Place()  │  tx     │                    │  tx    │  │ Orders  ││   │
-│  │  User.Create()  │         └───────────────────┘        │  │ Outbox  ││   │
-│  │  Shipment.Ship()│                                       │  │ Subs    ││   │
-│  └────────────────┘                                       │  │ Attempts││   │
-│                                                            │  └─────────┘│   │
-│  ┌──────────────────────────────────────────────────────┐ │              │   │
-│  │              Background Processor                     │ │              │   │
-│  │                                                       │ │              │   │
-│  │  ┌────────────┐  ┌─────────────┐  ┌──────────────┐  │ │              │   │
-│  │  │ Lock Batch  │─▶│  Deliver    │─▶│  Write Back   │  │ │              │   │
-│  │  │ (IOutbox    │  │  Webhooks   │  │  (Processed/  │  │ │              │   │
-│  │  │  Store)     │  │  (IWebhook  │  │   Retry/DLQ)  │  │ │              │   │
-│  │  │             │  │  Deliverer) │  │              │  │ │              │   │
-│  │  └────────────┘  └──────┬──────┘  └──────────────┘  │ │              │   │
-│  └──────────────────────────┼────────────────────────────┘ │              │   │
-│                              │                              └──────────────┘   │
-└──────────────────────────────┼───────────────────────────────────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │   External Systems   │
-                    │                      │
-                    │  Payment Service     │
-                    │  Inventory Service   │
-                    │  Tenant Webhooks     │
-                    │  Analytics Pipeline  │
-                    └─────────────────────┘
-```
-
-### Processing Modes
-
-InboxNet supports two processing topologies:
-
-**Direct Delivery** (default) — the background processor reads the outbox and delivers webhooks directly via HTTP. Simple, no additional infrastructure.
-
-```
-Outbox Table  ──▶  Processor  ──▶  HTTP Webhook
-```
-
-**Queue-Mediated** — the processor reads the outbox and publishes to Azure Storage Queue. A separate consumer (or Azure Function) dequeues and delivers. Decouples polling from delivery.
-
-```
-Outbox Table  ──▶  Processor  ──▶  Azure Queue  ──▶  Consumer  ──▶  HTTP Webhook
+External Provider
+      │
+      │  POST /webhooks/{providerKey}
+      ▼
+┌─────────────────────────────────────────┐
+│  MapInboxWebhooks (ASP.NET Core endpoint)│
+│                                          │
+│  1. Buffer raw body (once, for HMAC)     │
+│  2. Resolve IWebhookProvider by key      │──── key unknown ────▶ 404
+│  3. provider.ParseAsync()                │──── invalid sig ────▶ 400
+│  4. IInboxPublisher.PublishAsync()       │
+│     ├─ INSERT OR GET DUPLICATE           │──── duplicate ──────▶ 200 OK
+│     └─ Signal hot-path channel           │
+│  5. Return 202 Accepted                  │
+└──────────────────────────────────────────┘
+              │
+      ┌───────▼──────────┐
+      │  InboxMessages    │
+      │  Status = Pending │
+      └───────┬───────────┘
+              │
+┌─────────────▼──────────────────────────────────┐
+│             InboxProcessorService               │
+│  (BackgroundService, one per host instance)     │
+│                                                 │
+│  HOT PATH  Task 1                               │
+│  ──────────────────────────────────────────     │
+│  Parallel.ForEachAsync(channel.ReadAllAsync())  │
+│    ├─ add ID to _hotInFlight set                │
+│    ├─ TryLockByIdAsync (PK-seek UPDATE)         │
+│    │    WHERE Id=@id AND Status=Pending         │
+│    │    AND LockedUntil < NOW                   │
+│    ├─ if locked: DispatchMessageAsync()         │
+│    └─ remove from _hotInFlight                  │
+│                                                 │
+│  COLD PATH  Task 2                              │
+│  ──────────────────────────────────────────     │
+│  loop every ColdPollingInterval (default: 1s)   │
+│    ├─ snapshot _hotInFlight → skipIds JSON      │
+│    ├─ LockNextBatchAsync                        │
+│    │    WHERE Id NOT IN (skipIds via OPENJSON)  │
+│    │    AND Status=Pending                      │
+│    │    AND NextRetryAt <= NOW                  │
+│    └─ for each message: DispatchMessageAsync()  │
+└────────────────────────────────────────────────┘
+              │
+┌─────────────▼──────────────────────────────────┐
+│             DispatchMessageAsync                │
+│                                                 │
+│  1. GetMatching(providerKey, eventType)         │
+│     ─ returns ordered list of handler regs      │
+│                                                 │
+│  2. GetHandlerStatesAsync(messageId)            │
+│     ─ per-handler (AttemptCount, HasSuccess)    │
+│                                                 │
+│  3. foreach handler in order:                   │
+│     ├─ skip if HasSuccess (already succeeded)   │
+│     ├─ skip if AttemptCount >= MaxRetries        │
+│     ├─ handler.HandleAsync(message)             │
+│     └─ stop chain on first failure              │
+│                                                 │
+│  4. SaveAttemptsAsync([new attempt records])    │
+│                                                 │
+│  5. Decision:                                   │
+│     ├─ all ok          → MarkAsProcessed        │
+│     ├─ any failed      → IncrementRetry         │
+│     └─ all exhausted   → MarkAsDeadLettered     │
+└────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 3. Package Architecture
 
-InboxNet is composed of seven NuGet packages arranged in a dependency tree that allows consumers to pull in only what they need.
-
 ```
-                        InboxNet.Core
-                       (contracts, models,
-                        options, observability)
-                      ┌────────┼────────────┬──────────────┐
-                      │        │            │              │
-                      ▼        ▼            ▼              ▼
-          InboxNet.         InboxNet.   InboxNet.    InboxNet.
-          Entity             SqlServer   Processor     Delivery
-          FrameworkCore      (ADO.NET)   (background   (HTTP + HMAC
-          (EF Core +                      service)      + retry)
-           SQL Server)                       │
-                                             │
-                           ┌─────────────────┼──────────────┐
-                           │                                │
-                           ▼                                ▼
-                    InboxNet.                        InboxNet.
-                    AzureStorageQueue                 AzureFunctions
-                    (queue transport)                 (serverless trigger)
+                     InboxNet.Core
+                  (contracts, models,
+                   options, observability)
+                 ┌────────┬─────────────┬────────────┐
+                 │        │             │            │
+                 ▼        ▼             ▼            ▼
+         InboxNet.   InboxNet.    InboxNet.    InboxNet.
+         Entity      AspNetCore   Processor    Providers
+         Framework   (endpoint    (dispatcher  (Stripe,
+         Core        extension)   service)     GitHub,
+         (EF Core                              HMAC)
+          stores,
+          publisher)
 ```
 
-### Package Responsibilities
+### Package responsibilities
 
-| Package | Responsibility | Key Types |
-|---------|---------------|-----------|
-| **InboxNet.Core** | Defines all contracts, models, options, serialization, observability metrics, and the DI builder. Every other package depends on it. Contains zero implementation of persistence or delivery. | `IOutboxStore`, `IOutboxPublisher`, `ISubscriptionStore`, `IDeliveryAttemptStore`, `IWebhookDeliverer`, `IRetryPolicy`, `IOutboxProcessor`, `OutboxMessage`, `WebhookSubscription`, `DeliveryAttempt`, `OutboxOptions`, `OutboxMetrics`, `OutboxActivitySource` |
-| **InboxNet.EntityFrameworkCore** | EF Core + SQL Server persistence. Provides `OutboxDbContext`, EF type configurations, EF-based stores, and a publisher that enlists in the caller's `DbContext` transaction. Zero raw SQL — all queries use LINQ and `ExecuteUpdateAsync`. | `OutboxDbContext`, `EfCoreOutboxStore`, `EfCoreSubscriptionStore`, `EfCoreDeliveryAttemptStore`, `EfCoreOutboxPublisher<TDbContext>`, `ModelBuilderExtensions` |
-| **InboxNet.SqlServer** | Direct ADO.NET SQL Server persistence. No EF Core dependency. Each store opens its own `SqlConnection` from a connection string. The lock query uses `UPDATE...OUTPUT` with `UPDLOCK, READPAST` hints for maximum concurrent throughput. Publisher uses `ISqlTransactionAccessor` to join the caller's transaction. | `DirectSqlOutboxStore`, `DirectSqlSubscriptionStore`, `DirectSqlDeliveryAttemptStore`, `DirectSqlOutboxPublisher`, `ISqlTransactionAccessor` |
-| **InboxNet.Processor** | Background processing engine. A `BackgroundService` that polls the outbox on a configurable interval, locks a batch, delivers via the configured mode, and handles retries/dead-lettering. Verifies lock ownership before every delivery to prevent duplicate processing across instances. | `OutboxProcessorService`, `OutboxProcessingPipeline` |
-| **InboxNet.Delivery** | HTTP webhook delivery with HMAC-SHA256 signing, per-subscription timeouts, custom headers, and an exponential backoff retry policy with jitter. | `HttpWebhookDeliverer`, `HmacSignatureGenerator`, `ExponentialBackoffRetryPolicy` |
-| **InboxNet.AzureStorageQueue** | Azure Storage Queue transport for the queue-mediated processing mode. Wraps messages in a JSON envelope and publishes to a configurable queue. | `AzureStorageQueuePublisher` |
-| **InboxNet.AzureFunctions** | Azure Functions timer trigger that invokes the processing pipeline on a cron schedule (`*/10 * * * * *` by default). Enables serverless outbox processing without a long-running host. | `OutboxTimerFunction` |
+| Package | Key types | Purpose |
+|---|---|---|
+| **InboxNet.Core** | `IInboxHandler`, `IWebhookProvider`, `IInboxStore`, `IInboxPublisher`, `IInboxHandlerRegistry`, `InboxMessage`, `InboxOptions`, `InboxMetrics` | All contracts and models. Zero persistence or HTTP. |
+| **InboxNet.EntityFrameworkCore** | `InboxDbContext`, `EfCoreInboxStore`, `EfCoreInboxPublisher`, `ModelBuilderExtensions` | EF Core persistence. Provides `UseSqlServer()` on the builder. |
+| **InboxNet.AspNetCore** | `InboxEndpointRouteBuilderExtensions` | `MapInboxWebhooks()` / `MapInboxWebhook()` minimal-API endpoints. |
+| **InboxNet.Processor** | `InboxProcessorService`, `InboxProcessingPipeline` | `BackgroundService` running hot + cold dispatch loops. Provides `AddBackgroundDispatcher()`. |
+| **InboxNet.Providers** | `StripeWebhookProvider`, `GitHubWebhookProvider`, `GenericHmacWebhookProvider` | Ready-made signature validators for common providers. Provides `AddStripeProvider()`, `AddGitHubProvider()`, `AddGenericHmacProvider()`. |
 
 ---
 
 ## 4. Data Model
 
-### Tables
+All tables live in a configurable SQL schema (default: `inbox`).
 
-All tables live in a configurable SQL schema (default: `outbox`).
+### `InboxMessages`
 
-#### `OutboxMessages`
-
-The core queue. Messages are inserted transactionally, locked by the processor, and move through a state machine until delivered or dead-lettered.
+The durable queue. Messages are inserted on receipt, locked for dispatch, and move through a state machine until processed or dead-lettered.
 
 | Column | Type | Purpose |
-|--------|------|---------|
-| `Id` | `uniqueidentifier` | PK, default `NEWSEQUENTIALID()` |
-| `EventType` | `nvarchar(256)` | Routing key (e.g., `order.placed`) |
-| `Payload` | `nvarchar(max)` | Serialized event body (JSON) |
-| `CorrelationId` | `nvarchar(128)` | Caller-provided correlation for tracing |
-| `TraceId` | `nvarchar(128)` | OpenTelemetry trace propagation |
-| `Status` | `int` | Current state (see state machine below) |
-| `RetryCount` | `int` | Number of failed delivery attempts |
-| `CreatedAt` | `datetimeoffset(3)` | Insertion time |
-| `ProcessedAt` | `datetimeoffset(3)` | Time of successful delivery |
-| `LockedUntil` | `datetimeoffset(3)` | Visibility timeout expiry |
-| `LockedBy` | `nvarchar(256)` | Processor instance identity |
-| `NextRetryAt` | `datetimeoffset(3)` | Earliest time this message can be retried |
-| `LastError` | `nvarchar(max)` | Most recent failure reason |
-| `Headers` | `nvarchar(max)` | JSON dictionary of custom headers |
-
-**Indexes:**
-- `IX_OutboxMessages_Status_NextRetryAt` — batch lock query
-- `IX_OutboxMessages_CreatedAt` — ordering
-- `IX_OutboxMessages_EventType` — subscription routing
-
-#### `WebhookSubscriptions`
-
-Registered webhook endpoints. Each subscription targets a URL for a specific event type (or `*` for all events).
-
-| Column | Type | Purpose |
-|--------|------|---------|
+|---|---|---|
 | `Id` | `uniqueidentifier` | PK |
-| `EventType` | `nvarchar(256)` | Event filter (`order.placed` or `*`) |
-| `WebhookUrl` | `nvarchar(2048)` | Delivery endpoint |
-| `Secret` | `nvarchar(512)` | HMAC-SHA256 signing key |
-| `IsActive` | `bit` | Soft-delete flag |
-| `MaxRetries` | `int` | Per-subscription retry limit |
-| `TimeoutSeconds` | `int` | Per-subscription HTTP timeout |
-| `CreatedAt` | `datetimeoffset(3)` | Creation time |
-| `UpdatedAt` | `datetimeoffset(3)` | Last modification time |
-| `CustomHeaders` | `nvarchar(max)` | JSON dictionary of extra HTTP headers |
+| `ProviderKey` | `nvarchar(128)` | Which provider delivered this (e.g. `"stripe"`) |
+| `EventType` | `nvarchar(256)` | Provider's canonical event name (e.g. `"invoice.paid"`) |
+| `Payload` | `nvarchar(max)` | Raw request body as received |
+| `ContentSha256` | `nvarchar(64)` | SHA-256 of `Payload` — part of dedup key |
+| `ProviderEventId` | `nvarchar(256)?` | Provider's own stable event ID when available |
+| `DedupKey` | `nvarchar(256)` | `ProviderEventId` if set, else `ContentSha256` |
+| `Status` | `int` | State machine value (see below) |
+| `RetryCount` | `int` | Number of failed dispatch cycles |
+| `ReceivedAt` | `datetimeoffset(3)` | When the HTTP request was received |
+| `ProcessedAt` | `datetimeoffset(3)?` | When all handlers succeeded |
+| `LockedUntil` | `datetimeoffset(3)?` | Visibility timeout expiry |
+| `LockedBy` | `nvarchar(256)?` | Dispatcher instance identity |
+| `NextRetryAt` | `datetimeoffset(3)?` | Earliest time this message can be retried |
+| `LastError` | `nvarchar(max)?` | Most recent handler failure message |
+| `CorrelationId` | `nvarchar(128)?` | From provider parse result |
+| `TraceId` | `nvarchar(128)?` | OpenTelemetry trace propagation |
+| `TenantId` | `nvarchar(256)?` | From provider parse result (e.g. Stripe Connect account) |
+| `EntityId` | `nvarchar(256)?` | From provider parse result — drives ordered dispatch |
 
-#### `DeliveryAttempts`
+**Unique index:** `(ProviderKey, DedupKey)` — enforces deduplication at the database level.
 
-Audit log. Every webhook delivery — successful or failed — is recorded with full HTTP details.
+### `InboxHandlerAttempts`
+
+Per-handler attempt log. Enables skip-on-success retry semantics.
 
 | Column | Type | Purpose |
-|--------|------|---------|
+|---|---|---|
 | `Id` | `uniqueidentifier` | PK |
-| `OutboxMessageId` | `uniqueidentifier` | FK → OutboxMessages |
-| `WebhookSubscriptionId` | `uniqueidentifier` | FK → WebhookSubscriptions |
-| `AttemptNumber` | `int` | Sequential attempt counter |
-| `Status` | `int` | Pending / Success / Failed / DeadLettered |
-| `HttpStatusCode` | `int?` | Response status (null if network error) |
-| `ResponseBody` | `nvarchar(4000)` | Truncated response for debugging |
-| `ErrorMessage` | `nvarchar(max)` | Exception message or failure detail |
-| `DurationMs` | `bigint` | Round-trip time in milliseconds |
-| `AttemptedAt` | `datetimeoffset(3)` | When the attempt was made |
-| `NextRetryAt` | `datetimeoffset(3)` | Scheduled next attempt (if retrying) |
+| `InboxMessageId` | `uniqueidentifier` | FK → InboxMessages |
+| `HandlerName` | `nvarchar(512)` | Stable handler identity (type full name by default) |
+| `AttemptNumber` | `int` | 1-based attempt counter per handler |
+| `Status` | `int` | Success / Failed / DeadLettered |
+| `DurationMs` | `bigint` | Handler execution time |
+| `ErrorMessage` | `nvarchar(max)?` | Exception message on failure |
+| `AttemptedAt` | `datetimeoffset(3)` | When this attempt ran |
 
-### Message State Machine
+### Message state machine
 
 ```
-                           ┌──────────────────────────────────────┐
-                           │                                      │
-                           ▼                                      │
-  ┌──────────┐      ┌─────────────┐      ┌─────────────┐        │
-  │  Pending  │─────▶│  Processing  │─────▶│  Delivered   │        │
-  │  (0)      │      │  (1)        │      │  (3)         │        │
-  └──────────┘      └──────┬──────┘      └──────────────┘        │
-       ▲                    │                                      │
-       │                    │  delivery failed,                    │
-       │                    │  retries remaining                   │
-       │                    ▼                                      │
-       │              set NextRetryAt                              │
-       │              reset to Pending ────────────────────────────┘
-       │
-       │                    │  delivery failed,
-       │                    │  retries exhausted
-       │                    ▼
-       │             ┌──────────────┐
-       │             │ DeadLettered  │
-       │             │ (5)           │
-       │             └──────────────┘
-       │
-       │              lock expired
-       │              (visibility timeout)
-       └──────────── reset by ReleaseExpiredLocksAsync()
-```
+             ┌──────────┐
+   receive   │  Pending  │
+  ──────────▶│   (0)    │
+             └────┬─────┘
+                  │ lock
+                  ▼
+             ┌────────────┐
+             │ Processing  │
+             │   (1)      │
+             └──┬──────┬──┘
+                │      │
+    all ok      │      │  failure,
+                ▼      │  retries remain
+          ┌──────────┐  │
+          │Processed │  │ set NextRetryAt,
+          │  (3)     │  │ increment RetryCount,
+          └──────────┘  │ clear lock
+                        ▼
+                   ┌──────────┐
+                   │ Pending  │◀── cold path picks up
+                   │   (0)    │    after NextRetryAt
+                   └────┬─────┘
+                        │
+                        │  retries exhausted
+                        ▼
+                  ┌────────────┐
+                  │DeadLettered│
+                  │   (5)      │
+                  └────────────┘
 
-Key transitions:
-- **Pending → Processing**: `LockNextBatchAsync` sets `Status=Processing`, `LockedBy`, `LockedUntil`
-- **Processing → Delivered**: All subscriptions delivered successfully
-- **Processing → Pending** (retry): At least one subscription failed, retries remaining — sets `NextRetryAt`, increments `RetryCount`, clears lock
-- **Processing → DeadLettered**: Retries exhausted, message moved to dead letter for manual investigation
-- **Processing → Pending** (lock expired): `ReleaseExpiredLocksAsync` reclaims messages whose `LockedUntil` has passed — safety net against crashed processors
-
----
-
-## 5. Concurrency and Multi-Instance Safety
-
-InboxNet is designed to run across multiple processor instances without duplicate delivery or lost messages. This section documents the locking protocol and the guarantees it provides.
-
-### The Locking Protocol
-
-Each message has three lock-related columns: `LockedBy`, `LockedUntil`, and `Status`.
-
-**Lock acquisition** (`LockNextBatchAsync`):
-1. Select messages where `Status IN (Pending, Processing)` AND `(LockedUntil IS NULL OR LockedUntil < NOW)` AND `(NextRetryAt IS NULL OR NextRetryAt <= NOW)`
-2. Update matching rows: set `Status = Processing`, `LockedBy = instanceId`, `LockedUntil = NOW + visibilityTimeout`
-3. Return the updated messages
-
-**Lock ownership check** (`IsLockHeldAsync`):
-Before delivering each message, the processor verifies `LockedBy == instanceId AND Status == Processing AND LockedUntil > NOW`.
-
-**Lock-guarded write-back**:
-Every state transition (`MarkAsProcessedAsync`, `IncrementRetryAsync`, `MarkAsDeadLetteredAsync`, `MarkAsFailedAsync`) includes `WHERE LockedBy = @lockedBy`. If another instance has stolen the lock, the UPDATE affects 0 rows and returns `false`.
-
-**Lock expiry** (`ReleaseExpiredLocksAsync`):
-At the start of each processing cycle, messages with `LockedUntil < NOW` are reset to `Pending`. This reclaims messages from crashed or stuck processors.
-
-### Instance Identity
-
-Each processor instance generates a globally unique identity at startup:
-
-```csharp
-InstanceId = $"{Environment.MachineName}-{Guid.NewGuid():N}"
-```
-
-This ensures that even in containerized environments where multiple replicas share a hostname, no two instances share an identity.
-
-### Concurrent Processor Scenarios
-
-#### EF Core store (no SQL lock hints)
-
-The EF Core `LockNextBatchAsync` uses `ExecuteUpdateAsync` with a `WHERE LockedUntil < NOW` filter. Under SQL Server's READ COMMITTED isolation:
-
-- Two processors issuing concurrent `ExecuteUpdateAsync` calls: one acquires row-level X locks first. The second blocks on those locks.
-- When the first commits, the second re-evaluates the predicate. Since `LockedUntil` is now in the future, the rows are excluded.
-- The second processor gets a different batch (or an empty one if no more messages are pending).
-
-**Trade-off**: Under high concurrency, the second processor briefly blocks instead of instantly skipping locked rows. For most workloads (single instance or polling intervals of several seconds), this is negligible.
-
-#### Direct SQL store (UPDLOCK, READPAST hints)
-
-The direct SQL `LockNextBatchAsync` uses `UPDATE...OUTPUT...WITH (UPDLOCK, READPAST)`:
-
-- `READPAST` instructs SQL Server to skip rows that are locked by other transactions, instead of blocking.
-- `UPDLOCK` acquires update locks during the scan phase, preventing two processors from selecting the same rows.
-- The `OUTPUT INSERTED.*` clause returns the updated rows atomically in a single round-trip.
-
-**Result**: Multiple processor instances can poll concurrently without blocking each other. Each gets a distinct batch. This is optimal for high-throughput, multi-instance deployments.
-
-### Stolen Lock Protection
-
-If a processor's delivery takes longer than the visibility timeout:
-
-1. `ReleaseExpiredLocksAsync` (called by another instance) resets the message to `Pending`
-2. Another instance locks and begins processing the same message
-3. The original processor finishes delivery and calls `MarkAsProcessedAsync`
-4. The `WHERE LockedBy = @lockedBy` guard fails (returns `false`) — the write-back is silently rejected
-5. The new owner completes delivery independently
-
-**Worst case**: The webhook is delivered twice (once by the original, once by the new owner). This is inherent in at-least-once delivery systems. Receivers must be idempotent — InboxNet provides `X-Outbox-Delivery-Id` headers to support deduplication.
-
----
-
-## 6. Webhook Delivery
-
-### Request Format
-
-Every webhook delivery sends an HTTP POST with the following headers:
-
-| Header | Purpose |
-|--------|---------|
-| `Content-Type: application/json` | Payload encoding |
-| `X-Outbox-Signature` | HMAC-SHA256 signature: `sha256=<hex>` |
-| `X-Outbox-Event` | Event type (e.g., `order.placed`) |
-| `X-Outbox-Delivery-Id` | Unique ID for this delivery attempt (for deduplication) |
-| `X-Outbox-Timestamp` | Unix timestamp of the delivery attempt |
-| `X-Outbox-Correlation-Id` | Correlation ID (if provided by the publisher) |
-| *Custom headers* | Per-subscription custom headers from `WebhookSubscription.CustomHeaders` |
-
-### Signature Verification
-
-The `X-Outbox-Signature` header contains an HMAC-SHA256 hash of the request body, computed with the subscription's shared secret:
-
-```
-HMAC-SHA256(key=subscription.Secret, data=message.Payload)
-→ sha256=<lowercase hex>
-```
-
-Receivers should verify this signature to ensure the webhook is authentic and hasn't been tampered with.
-
-### Retry Policy
-
-Failed deliveries are retried with exponential backoff and jitter:
-
-```
-delay = min(baseDelay × 2^retryCount, maxDelay) ± jitter
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `MaxRetries` | 5 | Maximum number of retry attempts |
-| `BaseDelay` | 5 seconds | Starting delay |
-| `MaxDelay` | 5 minutes | Upper bound on delay |
-| `JitterFactor` | 0.2 (±20%) | Randomization to prevent thundering herd |
-
-After `MaxRetries` attempts, the message is moved to the `DeadLettered` state for manual investigation.
-
-### Per-Subscription Configuration
-
-Each `WebhookSubscription` has independent settings:
-
-- **Timeout**: HTTP request timeout (default 30s). Slow endpoints don't affect faster ones.
-- **MaxRetries**: Override the global retry count per subscription.
-- **Secret**: Unique HMAC key per endpoint.
-- **CustomHeaders**: Additional HTTP headers (e.g., `Authorization`, `X-Tenant-Id`).
-
----
-
-## 7. Observability
-
-### Distributed Tracing (OpenTelemetry)
-
-InboxNet creates `Activity` spans via `System.Diagnostics.ActivitySource` named `"InboxNet"`:
-
-| Span | Tags | Created by |
-|------|------|-----------|
-| `outbox.publish` | `outbox.event_type`, `outbox.message_id` | `IOutboxPublisher.PublishAsync` |
-| `outbox.process_batch` | `outbox.batch_size` | `OutboxProcessingPipeline.ProcessBatchAsync` |
-| `outbox.deliver_webhook` | `outbox.message_id`, `outbox.subscription_id`, `outbox.event_type`, `outbox.webhook_url`, `http.status_code`, `outbox.delivery.success` | `HttpWebhookDeliverer.DeliverAsync` |
-
-To collect these spans, register the source in your OpenTelemetry configuration:
-
-```csharp
-builder.Services.AddOpenTelemetry()
-    .WithTracing(t => t.AddSource("InboxNet"));
-```
-
-### Metrics (System.Diagnostics.Metrics)
-
-InboxNet exposes a `Meter` named `"InboxNet"` with the following instruments:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `outbox.messages.published` | Counter | Messages written to the outbox |
-| `outbox.messages.processed` | Counter | Messages successfully delivered |
-| `outbox.messages.failed` | Counter | Messages that failed (will retry) |
-| `outbox.messages.dead_lettered` | Counter | Messages moved to dead letter |
-| `outbox.delivery.attempts` | Counter | Total webhook HTTP attempts |
-| `outbox.delivery.successes` | Counter | Successful HTTP deliveries |
-| `outbox.delivery.failures` | Counter | Failed HTTP deliveries |
-| `outbox.delivery.duration_ms` | Histogram | Webhook round-trip time |
-| `outbox.processing.duration_ms` | Histogram | Batch processing time |
-| `outbox.batches.processed` | Counter | Number of batches processed |
-| `outbox.batch.size` | Histogram | Messages per batch |
-
-All counters are tagged with `event_type` for per-event-type breakdowns.
-
----
-
-## 8. Configuration Reference
-
-### OutboxOptions
-
-```csharp
-services.AddInboxNet(options =>
-{
-    options.SchemaName = "outbox";                            // SQL schema name
-    options.BatchSize = 50;                                   // Messages per processing cycle
-    options.DefaultVisibilityTimeout = TimeSpan.FromSeconds(60); // Lock duration
-    options.InstanceId = "custom-id";                         // Override auto-generated instance ID
-    options.MaxConcurrentDeliveries = 10;                     // Parallel webhook calls per batch
-    options.ProcessingMode = ProcessingMode.DirectDelivery;   // or QueueMediated
-});
-```
-
-### ProcessorOptions
-
-```csharp
-.AddBackgroundProcessor(options =>
-{
-    options.PollingInterval = TimeSpan.FromSeconds(10);       // How often to poll for new messages
-});
-```
-
-### WebhookDeliveryOptions
-
-```csharp
-.AddWebhookDelivery(options =>
-{
-    options.HttpTimeout = TimeSpan.FromSeconds(30);           // Default HTTP timeout
-    options.Retry.MaxRetries = 5;
-    options.Retry.BaseDelay = TimeSpan.FromSeconds(5);
-    options.Retry.MaxDelay = TimeSpan.FromMinutes(5);
-    options.Retry.JitterFactor = 0.2;
-});
+  Any state with expired LockedUntil:
+  ReleaseExpiredLocksAsync() → reset to Pending
 ```
 
 ---
 
-## 9. Integration Patterns
+## 5. Hot Path and Cold Path
 
-### Pattern 1: EF Core Application with Background Processor
+### Hot path
 
-The most common setup. The outbox publisher enlists in your application's EF Core transaction.
+On every `PublishAsync()` call, after the INSERT commits, the publisher writes the new message ID to a `Channel<Guid>` (capacity 10,000, `DropOldest`). The hot path drains the channel continuously with `Parallel.ForEachAsync`.
 
-```csharp
-// Program.cs
-builder.Services.AddInboxNet(o => o.SchemaName = "outbox")
-    .UseSqlServer<AppDbContext>(connectionString)
-    .AddBackgroundProcessor(o => o.PollingInterval = TimeSpan.FromSeconds(5))
-    .AddWebhookDelivery();
+For each ID dequeued:
 
-// Command handler
-await using var tx = await _db.Database.BeginTransactionAsync(ct);
-_db.Orders.Add(order);
-await _db.SaveChangesAsync(ct);
-await _outbox.PublishAsync("order.placed", new { order.Id, order.Total }, ct: ct);
-await tx.CommitAsync(ct);
+1. Add to `_hotInFlight` (`ConcurrentDictionary<Guid, byte>`)
+2. `TryLockByIdAsync` — single-row `UPDATE WHERE Id=@id AND Status=Pending AND LockedUntil < NOW OUTPUT INSERTED.*`
+3. If locked: run `DispatchMessageAsync`
+4. If not locked (another instance beat us): do nothing
+5. Remove from `_hotInFlight` in `finally`
+
+Same-instance latency from publish to first handler invocation is typically under 1 ms.
+
+### Cold path
+
+Runs every `ColdPollingInterval` (default 1 second) regardless of channel activity. Before querying, it snapshots `_hotInFlight` and passes the IDs as `@skipJson`:
+
+```sql
+AND m.[Id] NOT IN (SELECT CAST([value] AS uniqueidentifier) FROM OPENJSON(@skipJson))
 ```
 
-### Pattern 2: Dapper/ADO.NET Application
+This prevents the cold path from racing against the hot path for IDs currently being processed on this instance. Cross-instance concurrency is handled by `WITH (UPDLOCK, READPAST)` on the batch lock query — if another instance holds an update lock on a row, this instance skips it rather than blocking.
 
-For applications that don't use EF Core. The consumer provides `ISqlTransactionAccessor` to let the publisher join their transaction.
+The cold path covers four scenarios the hot path cannot:
 
-```csharp
-// Program.cs
-builder.Services.AddInboxNet()
-    .UseDirectSqlServer(connectionString)
-    .AddBackgroundProcessor()
-    .AddWebhookDelivery();
-builder.Services.AddScoped<ISqlTransactionAccessor, MySqlTransactionAccessor>();
-
-// Command handler
-await using var conn = new SqlConnection(connectionString);
-await conn.OpenAsync(ct);
-await using var tx = conn.BeginTransaction();
-// ... domain writes with Dapper/ADO.NET ...
-_txAccessor.Connection = conn;
-_txAccessor.Transaction = tx;
-await _outbox.PublishAsync("order.placed", payload, ct: ct);
-await tx.CommitAsync(ct);
-```
-
-### Pattern 3: Serverless with Azure Functions
-
-The outbox is processed by an Azure Functions timer trigger instead of a background service. No long-running host required.
-
-```csharp
-// Program.cs (Azure Functions isolated worker)
-builder.Services.AddInboxNet()
-    .UseSqlServer<AppDbContext>(connectionString)  // or UseDirectSqlServer
-    .AddAzureFunctionsProcessor()
-    .AddWebhookDelivery();
-```
-
-### Pattern 4: Queue-Mediated Processing
-
-For high-throughput systems where you want to decouple polling from delivery. The processor pushes to Azure Storage Queue; delivery happens separately.
-
-```csharp
-builder.Services.AddInboxNet(o => o.ProcessingMode = ProcessingMode.QueueMediated)
-    .UseSqlServer<AppDbContext>(connectionString)
-    .UseAzureStorageQueue(o =>
-    {
-        o.ConnectionString = azureStorageConnString;
-        o.QueueName = "outbox-messages";
-    })
-    .AddBackgroundProcessor();
-```
-
----
-
-## 10. Value Proposition Summary
-
-| Without InboxNet | With InboxNet |
+| Scenario | Cause |
 |---|---|
-| Database writes and webhook calls are separate operations that can partially fail | Outbox message is written in the same DB transaction — atomic by construction |
-| App crash between DB commit and webhook → lost notification | Message persists in the outbox regardless of app crashes — processor delivers it |
-| No visibility into whether webhooks were delivered | Full audit trail in `DeliveryAttempts` with HTTP status, response, duration |
-| Manual retry logic per integration point | Configurable exponential backoff with jitter, dead-letter queue, per-subscription settings |
-| Webhook receivers can't verify authenticity | HMAC-SHA256 signed payloads with per-subscription secrets |
-| Multiple processor instances can duplicate delivery | Lock ownership protocol with instance identity, visibility timeouts, and guarded write-backs |
-| No standardized observability | Built-in OpenTelemetry traces and System.Diagnostics.Metrics for dashboards and alerting |
-| Each team builds ad-hoc outbox implementations | Single, tested library with modular packages — use only what you need |
+| Message from another instance | Hot path channel is in-process only |
+| Scheduled retry | `NextRetryAt > NOW` when published; becomes eligible later |
+| Channel overflow | Burst > 10,000 dropped the hint; row is still in the DB |
+| Expired lock recovery | `ReleaseExpiredLocksAsync` (throttled to once per 30 s) resets stuck messages |
+
+---
+
+## 6. Per-Handler Attempt Tracking
+
+Unlike a simple "retry the whole message" model, InboxNet tracks each handler independently.
+
+Before dispatching, the pipeline calls `GetHandlerStatesAsync(messageId, handlerNames)`, which returns `(AttemptCount, HasSuccess)` per handler name. The dispatch loop then:
+
+- **Skips** handlers where `HasSuccess = true` — they already did their work
+- **Skips** handlers where `AttemptCount >= MaxRetries` — they are exhausted
+- **Runs** all remaining handlers sequentially, stopping the chain on the first failure
+
+This means if you have three handlers and the second one fails, retries run only handlers 2 and 3 (handler 1's success is recorded and skipped). Handler names are stable identifiers — changing a handler's registered name after deployment makes prior success records invisible to it.
+
+**Bookkeeping failure safety:** if `SaveAttemptsAsync` throws after a handler has already succeeded, InboxNet does not schedule an immediate retry. Instead it leaves the lock in place to expire. When the lock expires, `ReleaseExpiredLocksAsync` resets the message to Pending, and the next dispatch reads whatever partial attempt records did save. Handlers that succeeded and whose records were saved will be skipped. This is why handlers must be idempotent.
+
+---
+
+## 7. Deduplication
+
+Dedup operates at two levels:
+
+**Database level (hard dedup):** `InboxMessages` has a unique index on `(ProviderKey, DedupKey)`. If a second INSERT arrives with the same pair, the store returns the existing row's ID with `IsDuplicate = true`. The endpoint returns `200 OK` — a safe acknowledgement that tells the provider "we already have this, stop retrying."
+
+**Dedup key selection:**
+- If the provider sets `ProviderEventId` in its `WebhookParseResult` (e.g. Stripe's `evt_...` or GitHub's `X-GitHub-Delivery`), that value is the dedup key. Stable across any number of provider retries.
+- If the provider does not supply an event ID, the dedup key is SHA-256 of the raw body. This catches exact-duplicate retries but not re-deliveries with mutated bodies.
+
+---
+
+## 8. Multi-Instance Safety
+
+Multiple instances share the same SQL Server database. Safety guarantees:
+
+**Lock acquisition is atomic.** `TryLockByIdAsync` and `LockNextBatchAsync` both use `UPDATE ... OUTPUT INSERTED.*`. SQL Server evaluates the `WHERE` predicate and applies the lock atomically — only one instance can update a given row.
+
+**Write-backs are lock-guarded.** Every terminal operation includes `WHERE LockedBy = @lockedBy`. If another instance reclaimed the lock (e.g. after lock expiry), the update affects 0 rows and is silently ignored.
+
+**Instance identity is globally unique.** Default `InstanceId = "{MachineName}-{Guid.NewGuid():N}"` — unique even across containers sharing a hostname.
+
+**Lock expiry.** If a dispatcher instance crashes mid-handler, `LockedUntil` expires and `ReleaseExpiredLocksAsync` resets the message to Pending. The retry does not increment `RetryCount` — an expired lock indicates infrastructure failure, not a handler failure. Counting it against the retry budget would dead-letter healthy messages after pod restarts.
+
+**Worst case:** a handler runs twice (once by the crashed instance, once by the recovery). InboxNet provides at-least-once delivery. Handlers must be idempotent on `InboxMessage.Id`.
+
+---
+
+## 9. Provider Model
+
+Providers do two things: validate the request's authenticity and extract canonical event fields. They are stateless adapters between an external provider's wire format and InboxNet's `WebhookParseResult`.
+
+```csharp
+public interface IWebhookProvider
+{
+    string Key { get; }   // stable routing key, e.g. "stripe"
+    Task<WebhookParseResult> ParseAsync(WebhookRequestContext context, CancellationToken ct);
+}
+```
+
+`WebhookRequestContext` carries the buffered raw body (buffered once, before any provider sees it), all request headers, the route path, and query string.
+
+`WebhookParseResult.Valid(...)` carries:
+- `EventType` — matched against handler registrations
+- `Payload` — raw body, stored as-is in `InboxMessages.Payload`
+- `ContentSha256` — for dedup when no provider event ID is available
+- `ProviderEventId` — preferred dedup key
+- `EntityId` — optional; drives ordered dispatch
+- `TenantId` — optional; stored for tenant-scoped queries and dispatch filtering
+- `CorrelationId` — forwarded to the message for tracing
+
+For providers where signature validation and payload parsing are separate concerns (e.g. shared validator across multiple payload schemas), register them as a keyed pair:
+
+```csharp
+.AddProvider<MySignatureValidator, MyPayloadMapper>("my-provider")
+```
+
+The builder composes them into a `CompositeWebhookProvider` automatically.
+
+---
+
+## 10. Observability
+
+InboxNet emits OpenTelemetry signals via `System.Diagnostics.ActivitySource` and `System.Diagnostics.Metrics`, both named `"InboxNet"`.
+
+### Activity spans
+
+| Span | When | Key tags |
+|---|---|---|
+| `inbox.receive` | Per HTTP request | `inbox.provider_key`, `inbox.valid` |
+| `inbox.process_batch` | Per cold-path cycle | `inbox.batch_size` |
+| `inbox.dispatch` | Per message | `inbox.message_id`, `inbox.provider_key`, `inbox.event_type` |
+
+### Metrics
+
+| Metric | Type | Tags |
+|---|---|---|
+| `inbox.messages.received` | Counter | `provider` |
+| `inbox.messages.invalid` | Counter | `provider` |
+| `inbox.messages.processed` | Counter | `provider`, `event_type` |
+| `inbox.messages.failed` | Counter | `provider`, `event_type` |
+| `inbox.messages.dead_lettered` | Counter | `provider`, `event_type` |
+| `inbox.handlers.attempts` | Counter | `handler`, `provider`, `event_type` |
+| `inbox.handlers.successes` | Counter | `handler`, `provider`, `event_type` |
+| `inbox.handlers.failures` | Counter | `handler`, `provider`, `event_type` |
+| `inbox.handlers.duration_ms` | Histogram | `handler` |
+| `inbox.batches.processed` | Counter | — |
+| `inbox.batch.size` | Histogram | — |
+| `inbox.processing.duration_ms` | Histogram | — |

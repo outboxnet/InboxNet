@@ -1,6 +1,6 @@
 <Solution>
   <Folder Name="/samples/">
-    <Project Path="samples/InboxNet.Inbox.SampleApp/InboxNet.Inbox.SampleApp.csproj" />
+    <Project Path="samples/InboxNet.SampleApp/InboxNet.SampleApp.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="InboxNet.SampleApp/InboxNet.SampleApp.csproj" Id="eee5f658-8c5b-48ba-a9d5-0d4244991765" />
@@ -9,11 +9,11 @@
     <Project Path="src/InboxNet.Core/InboxNet.Core.csproj" />
     <Project Path="src/InboxNet.Delivery/InboxNet.Delivery.csproj" />
     <Project Path="src/InboxNet.EntityFrameworkCore/InboxNet.EntityFrameworkCore.csproj" />
-    <Project Path="src/InboxNet.Inbox.AspNetCore/InboxNet.Inbox.AspNetCore.csproj" />
-    <Project Path="src/InboxNet.Inbox.Core/InboxNet.Inbox.Core.csproj" />
-    <Project Path="src/InboxNet.Inbox.EntityFrameworkCore/InboxNet.Inbox.EntityFrameworkCore.csproj" />
-    <Project Path="src/InboxNet.Inbox.Processor/InboxNet.Inbox.Processor.csproj" />
-    <Project Path="src/InboxNet.Inbox.Providers/InboxNet.Inbox.Providers.csproj" />
+    <Project Path="src/InboxNet.AspNetCore/InboxNet.AspNetCore.csproj" />
+    <Project Path="src/InboxNet.Core/InboxNet.Core.csproj" />
+    <Project Path="src/InboxNet.EntityFrameworkCore/InboxNet.EntityFrameworkCore.csproj" />
+    <Project Path="src/InboxNet.Processor/InboxNet.Processor.csproj" />
+    <Project Path="src/InboxNet.Providers/InboxNet.Providers.csproj" />
     <Project Path="src/InboxNet.Processor/InboxNet.Processor.csproj" />
     <Project Path="src/InboxNet.SqlServer/InboxNet.SqlServer.csproj" />
   </Folder>
