@@ -13,8 +13,8 @@
     <Company>InboxNet</Company>
     <Copyright>Copyright (c) 2024 InboxNet Contributors</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/undefined-exception/InboxNet</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/undefined-exception/InboxNet.git</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/outboxnet/InboxNet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/outboxnet/InboxNet.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
