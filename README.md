@@ -1,6 +1,6 @@
 # InboxNet
 
-[![CI](https://github.com/undefined-exception/InboxNet/actions/workflows/ci.yml/badge.svg)](https://github.com/undefined-exception/InboxNet/actions/workflows/ci.yml)
+[![CI](https://github.com/outboxnet/InboxNet/actions/workflows/ci.yml/badge.svg)](https://github.com/outboxnet/InboxNet/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/InboxNet.Core.svg)](https://www.nuget.org/packages/InboxNet.Core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
