@@ -568,7 +568,7 @@ Single-node run on `(localdb)\MSSQLLocalDB`, default visibility timeout, no fail
 
 The pipeline floor is **8 ms** end-to-end (HTTP ingress → DB INSERT → channel signal → batch lock → dispatch → handler). At 5,000 messages the publisher outpaces the dispatcher by ~260 msg/s for the duration of the publish phase, so a small steady-state queue forms and the p50 reflects average queue wait under sustained load rather than the empty-pipeline floor; p95/p99 stay tight because the queue never grows unbounded and drains within ~400 ms after the last publish.
 
-For comparison, the same workload with full-forensics defaults (`BulkBookkeeping=false`, `RecordAttemptsOnSuccess=true`) measured **155 msg/s** handler throughput and **p50 = 11.2 s** — the difference is the per-message round-trip count dropping from ~3 to ~1 plus the bulk processed-status UPDATE being amortised across the batch.
+For comparison, the same workload with full-forensics defaults (`BulkBookkeeping=false`, `RecordAttemptsOnSuccess=true`) measured **1,563 msg/s** handler throughput at **p50 = 257 ms** (min 13 ms, p95 405 ms, p99 464 ms, 0 lost / 0 duplicates). On LocalDB the bulk path is only ~3% faster than the per-message path at this batch size — the per-message INSERT/UPDATE is well-cached and the dispatcher's `Parallel.ForEachAsync` keeps the connection pool saturated either way. The bulk path's advantage widens on real SQL Server where log-flush cost per round-trip is the dominant factor; on LocalDB you can run with full attempt forensics enabled at almost no throughput cost.
 
 ### Tuning levers
 
