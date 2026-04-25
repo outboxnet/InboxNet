@@ -11,7 +11,8 @@
       "Bash(powershell.exe -Command ':*)",
       "Bash(xargs grep:*)",
       "Bash(find . -not -path './.vs/*' -not -path '*/bin/*' -not -path '*/obj/*' -type f \\\\\\( -name \"*.cs\" -o -name \"*.csproj\" -o -name \"*.slnx\" -o -name \"*.props\" -o -name \"*.md\" -o -name \"*.json\" -o -name \"*.yml\" -o -name \"*.yaml\" -o -name \"*.txt\" \\\\\\) -exec sed -i 's/OutboxNet/InboxNet/g' {} \\\\;)",
-      "Bash(find . -not -path './.vs/*' -not -path '*/bin/*' -not -path '*/obj/*' -type f \\\\\\( -name \"*.cs\" -o -name \"*.csproj\" -o -name \"*.slnx\" -o -name \"*.props\" -o -name \"*.md\" -o -name \"*.json\" -o -name \"*.yml\" -o -name \"*.yaml\" -o -name \"*.txt\" \\\\\\) -exec sed -i 's/InboxNet\\\\.Inbox\\\\./InboxNet./g' {} \\\\;)"
+      "Bash(find . -not -path './.vs/*' -not -path '*/bin/*' -not -path '*/obj/*' -type f \\\\\\( -name \"*.cs\" -o -name \"*.csproj\" -o -name \"*.slnx\" -o -name \"*.props\" -o -name \"*.md\" -o -name \"*.json\" -o -name \"*.yml\" -o -name \"*.yaml\" -o -name \"*.txt\" \\\\\\) -exec sed -i 's/InboxNet\\\\.Inbox\\\\./InboxNet./g' {} \\\\;)",
+      "Bash(dotnet run:*)"
     ]
   }
 }
