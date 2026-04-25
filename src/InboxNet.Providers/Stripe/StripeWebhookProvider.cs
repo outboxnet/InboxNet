@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Options;
 using InboxNet.Interfaces;
 using InboxNet.Models;
+using InboxNet.Options;
 
 namespace InboxNet.Providers.Stripe;
 
@@ -18,14 +19,18 @@ public sealed class StripeWebhookProvider : IWebhookProvider
     private const string SignatureHeader = "Stripe-Signature";
     private readonly StripeWebhookOptions _options;
     private readonly byte[] _signingKey;
+    private readonly bool _alwaysComputeSha;
 
-    public StripeWebhookProvider(IOptions<StripeWebhookOptions> options)
+    public StripeWebhookProvider(
+        IOptions<StripeWebhookOptions> options,
+        IOptions<InboxOptions> inboxOptions)
     {
         _options = options.Value;
         if (string.IsNullOrWhiteSpace(_options.SigningSecret))
             throw new InvalidOperationException(
                 "StripeWebhookOptions.SigningSecret must be set.");
         _signingKey = Encoding.UTF8.GetBytes(_options.SigningSecret);
+        _alwaysComputeSha = inboxOptions.Value.AlwaysComputeContentSha256;
     }
 
     public string Key => _options.Key;
@@ -97,7 +102,8 @@ public sealed class StripeWebhookProvider : IWebhookProvider
             return Task.FromResult(WebhookParseResult.Invalid("Body is not valid JSON"));
         }
 
-        var contentSha = WebhookSignatureHelpers.ComputeContentSha256(rawBody);
+        var contentSha = WebhookSignatureHelpers.ComputeContentSha256IfNeeded(
+            rawBody, eventId, _alwaysComputeSha);
 
         return Task.FromResult(WebhookParseResult.Valid(
             eventType: eventType,

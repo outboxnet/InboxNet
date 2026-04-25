@@ -33,18 +33,16 @@ public class InboxMessageConfiguration : IEntityTypeConfiguration<InboxMessage>
         builder.Property(m => m.CorrelationId).HasMaxLength(128);
         builder.Property(m => m.TraceId).HasMaxLength(128);
 
-        // ValueComparer is required when the converted property is a reference-type
-        // collection — without it EF compares by reference and would miss in-place mutations
-        // (headers["x"] = "y" wouldn't mark the entity dirty). Snapshot deep-copies so the
-        // change tracker's original-values snapshot doesn't alias the live dictionary.
+        // Headers have write-once semantics: the receive endpoint builds the dictionary,
+        // hands it to the publisher, and nothing in the dispatch pipeline mutates it after
+        // persistence (status updates go through ExecuteUpdateAsync and don't touch Headers).
+        // That lets us short-circuit the comparer to reference equality and skip the
+        // defensive snapshot copy — saving an O(N) Dict.Except per change check and an
+        // allocation per change-tracker snapshot.
         var headersComparer = new ValueComparer<Dictionary<string, string>?>(
-            (a, b) => ReferenceEquals(a, b) ||
-                      (a != null && b != null && a.Count == b.Count &&
-                       !a.Except(b).Any()),
-            v => v == null
-                ? 0
-                : v.Aggregate(0, (h, kv) => HashCode.Combine(h, kv.Key, kv.Value)),
-            v => v == null ? null : new Dictionary<string, string>(v));
+            (a, b) => ReferenceEquals(a, b),
+            v => v == null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(v),
+            v => v);
 
         builder.Property(m => m.Headers)
             .HasConversion(

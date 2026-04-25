@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using InboxNet.Extensions;
 using InboxNet.Interfaces;
+using InboxNet.Options;
 using InboxNet.Providers.Generic;
 using InboxNet.Providers.GitHub;
 using InboxNet.Providers.Stripe;
@@ -17,16 +18,7 @@ public static class ServiceCollectionExtensions
         this IInboxNetBuilder builder,
         Action<StripeWebhookOptions> configure)
     {
-        var opts = new StripeWebhookOptions();
-        configure(opts);
-
-        builder.Services.Configure<StripeWebhookOptions>(o =>
-        {
-            o.Key = opts.Key;
-            o.SigningSecret = opts.SigningSecret;
-            o.ToleranceSeconds = opts.ToleranceSeconds;
-        });
-
+        builder.Services.Configure(configure);
         builder.Services.AddSingleton<IWebhookProvider, StripeWebhookProvider>();
         return builder;
     }
@@ -38,15 +30,7 @@ public static class ServiceCollectionExtensions
         this IInboxNetBuilder builder,
         Action<GitHubWebhookOptions> configure)
     {
-        var opts = new GitHubWebhookOptions();
-        configure(opts);
-
-        builder.Services.Configure<GitHubWebhookOptions>(o =>
-        {
-            o.Key = opts.Key;
-            o.Secret = opts.Secret;
-        });
-
+        builder.Services.Configure(configure);
         builder.Services.AddSingleton<IWebhookProvider, GitHubWebhookProvider>();
         return builder;
     }
@@ -66,10 +50,11 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(opts.Key))
             throw new InvalidOperationException("GenericHmacWebhookOptions.Key must be set.");
 
-        // Instance registration so multiple keyed providers can coexist. Options are bound
-        // at construction; no Options pipeline is needed.
-        var provider = new GenericHmacWebhookProvider(opts);
-        builder.Services.AddSingleton<IWebhookProvider>(provider);
+        // Factory registration so multiple keyed providers can coexist; each closes over its
+        // own captured options snapshot. The provider also pulls the global InboxOptions
+        // from DI to honour AlwaysComputeContentSha256.
+        builder.Services.AddSingleton<IWebhookProvider>(sp =>
+            new GenericHmacWebhookProvider(opts, sp.GetRequiredService<IOptions<InboxOptions>>()));
         return builder;
     }
 }

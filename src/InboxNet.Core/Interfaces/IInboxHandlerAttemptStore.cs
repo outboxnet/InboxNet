@@ -12,11 +12,16 @@ public interface IInboxHandlerAttemptStore
 {
     Task SaveAttemptAsync(InboxHandlerAttempt attempt, CancellationToken ct = default);
 
-    Task SaveAttemptsAsync(IReadOnlyList<InboxHandlerAttempt> attempts, CancellationToken ct = default)
+    /// <summary>
+    /// Default implementation is sequential — a parallel <c>Task.WhenAll</c> over a single
+    /// scoped store would race the underlying connection. Implementations backed by a
+    /// thread-safe transport (e.g. one connection per attempt) may override.
+    /// </summary>
+    async Task SaveAttemptsAsync(IReadOnlyList<InboxHandlerAttempt> attempts, CancellationToken ct = default)
     {
-        if (attempts.Count == 0) return Task.CompletedTask;
-        if (attempts.Count == 1) return SaveAttemptAsync(attempts[0], ct);
-        return Task.WhenAll(attempts.Select(a => SaveAttemptAsync(a, ct)));
+        if (attempts.Count == 0) return;
+        for (var i = 0; i < attempts.Count; i++)
+            await SaveAttemptAsync(attempts[i], ct);
     }
 
     Task<IReadOnlyList<InboxHandlerAttempt>> GetByMessageIdAsync(Guid messageId, CancellationToken ct = default);

@@ -2,6 +2,11 @@ using InboxNet.Models;
 
 namespace InboxNet.Interfaces;
 
+/// <summary>
+/// One scheduled retry, used by <see cref="IInboxStore.IncrementRetryBulkAsync"/>.
+/// </summary>
+public readonly record struct InboxRetrySchedule(Guid MessageId, DateTimeOffset NextRetryAt, string? Error);
+
 public interface IInboxStore
 {
     /// <summary>
@@ -35,6 +40,18 @@ public interface IInboxStore
         string lockedBy,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// Locks every supplied id that is currently eligible (Pending, lock expired or absent,
+    /// retry due) in a single round-trip. Returns the message rows that won the lock —
+    /// some IDs may be missing if they were already locked, processed, or not yet due.
+    /// Used by the hot path to coalesce burst arrivals into one acquisition call.
+    /// </summary>
+    Task<IReadOnlyList<InboxMessage>> LockByIdsAsync(
+        IReadOnlyCollection<Guid> messageIds,
+        TimeSpan visibilityTimeout,
+        string lockedBy,
+        CancellationToken ct = default);
+
     Task<bool> MarkAsProcessedAsync(Guid messageId, string lockedBy, CancellationToken ct = default);
 
     /// <summary>
@@ -56,7 +73,26 @@ public interface IInboxStore
         string? error = null,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// Bulk retry-scheduling variant of <see cref="IncrementRetryAsync"/>. Each schedule
+    /// supplies its own <c>NextRetryAt</c> and <c>Error</c>; rows are scoped by
+    /// <paramref name="lockedBy"/>. Returns the number of rows updated.
+    /// </summary>
+    Task<int> IncrementRetryBulkAsync(
+        IReadOnlyCollection<InboxRetrySchedule> schedules,
+        string lockedBy,
+        CancellationToken ct = default);
+
     Task<bool> MarkAsDeadLetteredAsync(Guid messageId, string lockedBy, CancellationToken ct = default);
+
+    /// <summary>
+    /// Bulk dead-letter variant of <see cref="MarkAsDeadLetteredAsync"/>. Returns the number
+    /// of rows updated; missing entries indicate locks lost to expiry.
+    /// </summary>
+    Task<int> MarkAsDeadLetteredBulkAsync(
+        IReadOnlyCollection<Guid> messageIds,
+        string lockedBy,
+        CancellationToken ct = default);
 
     Task ReleaseExpiredLocksAsync(CancellationToken ct = default);
 

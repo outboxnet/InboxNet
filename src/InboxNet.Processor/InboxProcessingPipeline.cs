@@ -35,11 +35,12 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
     private readonly IInboxHandlerRegistry _handlerRegistry;
     private readonly IInboxRetryPolicy _retryPolicy;
     private readonly InboxOptions _options;
+    private readonly InboxProcessorOptions _processorOptions;
     private readonly ILogger<InboxProcessingPipeline> _logger;
 
-    // ReleaseExpiredLocksAsync is a table-wide UPDATE; throttle so a saturated hot path doesn't
-    // trigger it on every batch.
-    private static readonly TimeSpan ReleaseExpiredLocksInterval = TimeSpan.FromSeconds(30);
+    // ReleaseExpiredLocksAsync is a table-wide UPDATE; throttle so a saturated cold path
+    // doesn't trigger it on every batch. The interval is configurable via
+    // InboxProcessorOptions.ReleaseExpiredLocksInterval.
     private long _lastLockReleaseTicks = DateTimeOffset.MinValue.UtcTicks;
 
     public InboxProcessingPipeline(
@@ -47,12 +48,14 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
         IInboxHandlerRegistry handlerRegistry,
         IInboxRetryPolicy retryPolicy,
         IOptions<InboxOptions> options,
+        IOptions<InboxProcessorOptions> processorOptions,
         ILogger<InboxProcessingPipeline> logger)
     {
         _scopeFactory = scopeFactory;
         _handlerRegistry = handlerRegistry;
         _retryPolicy = retryPolicy;
         _options = options.Value;
+        _processorOptions = processorOptions.Value;
         _logger = logger;
     }
 
@@ -68,13 +71,7 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
             var sp = batchScope.ServiceProvider;
             var store = sp.GetRequiredService<IInboxStore>();
 
-            var nowTicks = DateTimeOffset.UtcNow.UtcTicks;
-            var lastTicks = Interlocked.Read(ref _lastLockReleaseTicks);
-            if (nowTicks - lastTicks >= ReleaseExpiredLocksInterval.Ticks
-                && Interlocked.CompareExchange(ref _lastLockReleaseTicks, nowTicks, lastTicks) == lastTicks)
-            {
-                await store.ReleaseExpiredLocksAsync(ct);
-            }
+            await MaybeReleaseExpiredLocksAsync(store, ct);
 
             var messages = await store.LockNextBatchAsync(
                 _options.BatchSize,
@@ -86,37 +83,10 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
             if (messages.Count == 0)
                 return 0;
 
-            InboxMetrics.BatchesProcessed.Add(1);
-            InboxMetrics.BatchSize.Record(messages.Count);
             activity?.SetTag("inbox.batch_size", messages.Count);
-
             _logger.LogInformation("Processing batch of {Count} inbox messages", messages.Count);
 
-            var bookkeeper = new BatchBookkeeper();
-
-            await Parallel.ForEachAsync(
-                messages,
-                new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = _options.MaxConcurrentDispatch,
-                    CancellationToken = ct
-                },
-                async (message, token) =>
-                {
-                    using var messageScope = _scopeFactory.CreateScope();
-                    var msp = messageScope.ServiceProvider;
-
-                    await DispatchMessageAsync(
-                        message,
-                        lockedBy,
-                        msp,
-                        bookkeeper,
-                        token);
-                });
-
-            await FlushBatchAsync(bookkeeper, lockedBy, sp, ct);
-
-            return messages.Count;
+            return await DispatchAndFlushAsync(messages, lockedBy, sp, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -149,6 +119,101 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
         await DispatchMessageAsync(message, lockedBy, sp, bookkeeper, ct);
         await FlushBatchAsync(bookkeeper, lockedBy, sp, ct);
         return true;
+    }
+
+    public async Task<int> TryProcessByIdsAsync(IReadOnlyCollection<Guid> messageIds, CancellationToken ct = default)
+    {
+        if (messageIds.Count == 0) return 0;
+
+        using var activity = InboxActivitySource.Source.StartActivity("inbox.process_by_ids");
+        var batchStopwatch = Stopwatch.StartNew();
+        var lockedBy = _options.InstanceId;
+
+        try
+        {
+            using var batchScope = _scopeFactory.CreateScope();
+            var sp = batchScope.ServiceProvider;
+            var store = sp.GetRequiredService<IInboxStore>();
+
+            var messages = await store.LockByIdsAsync(
+                messageIds,
+                _options.DefaultVisibilityTimeout,
+                lockedBy,
+                ct);
+
+            if (messages.Count == 0)
+                return 0;
+
+            activity?.SetTag("inbox.batch_size", messages.Count);
+
+            return await DispatchAndFlushAsync(messages, lockedBy, sp, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error processing inbox batch by ids ({Count} requested)", messageIds.Count);
+            throw;
+        }
+        finally
+        {
+            batchStopwatch.Stop();
+            InboxMetrics.ProcessingDuration.Record(batchStopwatch.Elapsed.TotalMilliseconds);
+        }
+    }
+
+    // ── Shared dispatch+flush ─────────────────────────────────────────────────
+
+    private async Task<int> DispatchAndFlushAsync(
+        IReadOnlyList<InboxMessage> messages,
+        string lockedBy,
+        IServiceProvider sp,
+        CancellationToken ct)
+    {
+        InboxMetrics.BatchesProcessed.Add(1);
+        InboxMetrics.BatchSize.Record(messages.Count);
+
+        var bookkeeper = new BatchBookkeeper();
+
+        if (messages.Count == 1)
+        {
+            // No point spinning up Parallel infrastructure for a single message.
+            await DispatchMessageAsync(messages[0], lockedBy, sp, bookkeeper, ct);
+        }
+        else
+        {
+            await Parallel.ForEachAsync(
+                messages,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = _options.MaxConcurrentDispatch,
+                    CancellationToken = ct
+                },
+                async (message, token) =>
+                {
+                    using var messageScope = _scopeFactory.CreateScope();
+                    var msp = messageScope.ServiceProvider;
+
+                    await DispatchMessageAsync(
+                        message,
+                        lockedBy,
+                        msp,
+                        bookkeeper,
+                        token);
+                });
+        }
+
+        await FlushBatchAsync(bookkeeper, lockedBy, sp, ct);
+        return messages.Count;
+    }
+
+    private async Task MaybeReleaseExpiredLocksAsync(IInboxStore store, CancellationToken ct)
+    {
+        var nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+        var lastTicks = Interlocked.Read(ref _lastLockReleaseTicks);
+        if (nowTicks - lastTicks >= _processorOptions.ReleaseExpiredLocksInterval.Ticks
+            && Interlocked.CompareExchange(ref _lastLockReleaseTicks, nowTicks, lastTicks) == lastTicks)
+        {
+            await store.ReleaseExpiredLocksAsync(ct);
+        }
     }
 
     // ── Core dispatch ─────────────────────────────────────────────────────────
@@ -349,41 +414,119 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
             }
         }
 
-        // 3. Per-message failure handling — each failure has its own retry schedule and
-        //    error string, so this can't be bulked the same way as success.
-        foreach (var (message, error) in bookkeeper.Failures)
+        // 3. Failure handling. Each failure has its own retry schedule and error string;
+        //    BulkBookkeeping=true coalesces the schedules into one OPENJSON-driven UPDATE.
+        //    Failures whose retry policy returned null are routed to dead-letter alongside
+        //    the bookkeeper.DeadLetters set. We pair each schedule with its source message
+        //    so the bulk path can emit per-message metrics without an O(N²) lookup.
+        var failureSnapshot = bookkeeper.Failures.ToList();
+        var policyDeadLetters = new List<InboxMessage>();
+        if (failureSnapshot.Count > 0)
         {
-            try
+            var pendingRetries = new List<(InboxMessage Message, InboxRetrySchedule Schedule)>(failureSnapshot.Count);
+            foreach (var (message, error) in failureSnapshot)
             {
-                await HandleMessageFailureAsync(message, lockedBy, store, error, ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogError(ex, "Error handling failure for message {MessageId}", message.Id);
-            }
-        }
-
-        // 4. Per-message dead-lettering — same reasoning as failure handling.
-        foreach (var message in bookkeeper.DeadLetters)
-        {
-            try
-            {
-                if (await store.MarkAsDeadLetteredAsync(message.Id, lockedBy, ct))
+                var nextDelay = _retryPolicy.GetNextDelay(message.RetryCount);
+                if (nextDelay.HasValue)
                 {
-                    InboxMetrics.MessagesDeadLettered.Add(1,
-                        new KeyValuePair<string, object?>("provider", message.ProviderKey),
-                        new KeyValuePair<string, object?>("event_type", message.EventType));
+                    var nextRetryAt = DateTimeOffset.UtcNow.Add(nextDelay.Value);
+                    pendingRetries.Add((message, new InboxRetrySchedule(message.Id, nextRetryAt, error)));
                 }
                 else
                 {
-                    _logger.LogWarning(
-                        "Lock lost for message {MessageId} during dead-letter handling",
-                        message.Id);
+                    policyDeadLetters.Add(message);
+                }
+            }
+
+            if (pendingRetries.Count > 0)
+            {
+                try
+                {
+                    if (_options.BulkBookkeeping)
+                    {
+                        var schedules = pendingRetries.Select(p => p.Schedule).ToList();
+                        var updated = await store.IncrementRetryBulkAsync(schedules, lockedBy, ct);
+                        if (updated < schedules.Count)
+                        {
+                            _logger.LogWarning(
+                                "Lock lost for {Lost}/{Total} message(s) during bulk retry-scheduling.",
+                                schedules.Count - updated, schedules.Count);
+                        }
+                        foreach (var (msg, _) in pendingRetries)
+                        {
+                            InboxMetrics.MessagesFailed.Add(1,
+                                new KeyValuePair<string, object?>("provider", msg.ProviderKey),
+                                new KeyValuePair<string, object?>("event_type", msg.EventType));
+                        }
+                    }
+                    else
+                    {
+                        foreach (var (msg, sched) in pendingRetries)
+                        {
+                            if (await store.IncrementRetryAsync(sched.MessageId, lockedBy, sched.NextRetryAt, sched.Error, ct))
+                            {
+                                InboxMetrics.MessagesFailed.Add(1,
+                                    new KeyValuePair<string, object?>("provider", msg.ProviderKey),
+                                    new KeyValuePair<string, object?>("event_type", msg.EventType));
+                            }
+                            else
+                            {
+                                _logger.LogWarning("Lock lost for message {MessageId} during failure handling", sched.MessageId);
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogError(ex, "Error scheduling retries for {Count} failure(s)", pendingRetries.Count);
+                }
+            }
+        }
+
+        // 4. Dead-lettering — handler-exhausted messages plus retry-policy-exhausted messages.
+        var allDeadLetters = bookkeeper.DeadLetters.ToList();
+        allDeadLetters.AddRange(policyDeadLetters);
+        if (allDeadLetters.Count > 0)
+        {
+            try
+            {
+                if (_options.BulkBookkeeping)
+                {
+                    var ids = allDeadLetters.Select(m => m.Id).ToArray();
+                    var updated = await store.MarkAsDeadLetteredBulkAsync(ids, lockedBy, ct);
+                    if (updated < ids.Length)
+                    {
+                        _logger.LogWarning(
+                            "Lock lost for {Lost}/{Total} message(s) during bulk dead-letter.",
+                            ids.Length - updated, ids.Length);
+                    }
+                    foreach (var msg in allDeadLetters)
+                    {
+                        InboxMetrics.MessagesDeadLettered.Add(1,
+                            new KeyValuePair<string, object?>("provider", msg.ProviderKey),
+                            new KeyValuePair<string, object?>("event_type", msg.EventType));
+                    }
+                }
+                else
+                {
+                    foreach (var msg in allDeadLetters)
+                    {
+                        if (await store.MarkAsDeadLetteredAsync(msg.Id, lockedBy, ct))
+                        {
+                            InboxMetrics.MessagesDeadLettered.Add(1,
+                                new KeyValuePair<string, object?>("provider", msg.ProviderKey),
+                                new KeyValuePair<string, object?>("event_type", msg.EventType));
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Lock lost for message {MessageId} during dead-letter handling", msg.Id);
+                        }
+                    }
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogError(ex, "Error dead-lettering message {MessageId}", message.Id);
+                _logger.LogError(ex, "Error dead-lettering {Count} message(s)", allDeadLetters.Count);
             }
         }
     }
@@ -526,53 +669,6 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
         {
             _logger.LogError(ex, "Failed to save {Count} handler attempt(s)", attempts.Count);
             return false;
-        }
-    }
-
-    private async Task HandleMessageFailureAsync(
-        InboxMessage message,
-        string lockedBy,
-        IInboxStore store,
-        string error,
-        CancellationToken ct)
-    {
-        var nextDelay = _retryPolicy.GetNextDelay(message.RetryCount);
-
-        if (nextDelay.HasValue)
-        {
-            var nextRetryAt = DateTimeOffset.UtcNow.Add(nextDelay.Value);
-
-            if (await store.IncrementRetryAsync(message.Id, lockedBy, nextRetryAt, error, ct))
-            {
-                InboxMetrics.MessagesFailed.Add(1,
-                    new KeyValuePair<string, object?>("provider", message.ProviderKey),
-                    new KeyValuePair<string, object?>("event_type", message.EventType));
-
-                _logger.LogWarning(
-                    "Message {MessageId} handler dispatch failed, scheduled retry at {NextRetryAt}",
-                    message.Id, nextRetryAt);
-            }
-            else
-            {
-                _logger.LogWarning("Lock lost for message {MessageId} during failure handling", message.Id);
-            }
-        }
-        else
-        {
-            if (await store.MarkAsDeadLetteredAsync(message.Id, lockedBy, ct))
-            {
-                InboxMetrics.MessagesDeadLettered.Add(1,
-                    new KeyValuePair<string, object?>("provider", message.ProviderKey),
-                    new KeyValuePair<string, object?>("event_type", message.EventType));
-
-                _logger.LogError("Message {MessageId} exhausted global retries, moved to dead letter", message.Id);
-            }
-            else
-            {
-                _logger.LogWarning(
-                    "Lock lost for message {MessageId} during dead-letter handling",
-                    message.Id);
-            }
         }
     }
 
