@@ -153,31 +153,73 @@ public static class InboxEndpointRouteBuilderExtensions
         return Results.Accepted(value: new { messageId = result.MessageId });
     }
 
-    private static async Task<string> ReadBoundedAsync(Stream body, long maxBytes, CancellationToken ct)
+    /// <summary>
+    /// Reads the stream as UTF-8 text with a size limit.
+    /// </summary>
+    /// <param name="body">Stream to read from (not disposed)</param>
+    /// <param name="maxBytes">Maximum allowed bytes</param>
+    /// <param name="ct">Cancellation token</param>
+    /// <returns>Decoded string</returns>
+    /// <exception cref="BodyTooLargeException">
+    /// Thrown when stream exceeds maxBytes
+    /// </exception>
+    private static async Task<string> ReadBoundedAsync(
+        Stream body,
+        long maxBytes,
+        CancellationToken ct)
     {
-        // 16 KB is a reasonable rent size: large enough to read most webhooks in one I/O,
-        // small enough that idle pool retention is cheap.
-        const int rentSize = 16 * 1024;
-        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(rentSize);
-        var sb = new StringBuilder();
-        long total = 0;
+        if (maxBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxBytes));
+
+        // Use MemoryStream as a safe accumulator for small/medium payloads
+        // This is surprisingly efficient for typical webhooks (<100KB)
+        using var memoryStream = new MemoryStream();
+
+        const int bufferSize = 81920; // 80KB - optimal for network streams
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+
         try
         {
-            int read;
-            while ((read = await body.ReadAsync(buffer.AsMemory(0, rentSize), ct)) > 0)
+            long totalBytes = 0;
+            int bytesRead;
+
+            while ((bytesRead = await body.ReadAsync(
+                buffer.AsMemory(0, bufferSize), ct).ConfigureAwait(false)) > 0)
             {
-                total += read;
-                if (total > maxBytes)
-                    throw new BodyTooLargeException();
-                sb.Append(Encoding.UTF8.GetString(buffer, 0, read));
+                totalBytes += bytesRead;
+
+                if (totalBytes > maxBytes)
+                {
+                    throw new BodyTooLargeException(
+                        $"Request body exceeds {maxBytes} bytes. " +
+                        $"Read {totalBytes} bytes before aborting.");
+                }
+
+                await memoryStream.WriteAsync(
+                    buffer.AsMemory(0, bytesRead), ct).ConfigureAwait(false);
             }
+
+            // Seek to beginning for reading
+            memoryStream.Position = 0;
+
+            // Now decode everything at once - correctly handles UTF-8
+            using var reader = new StreamReader(
+                memoryStream,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: false,
+                bufferSize: 4096,
+                leaveOpen: false);
+
+            return await reader.ReadToEndAsync(ct).ConfigureAwait(false);
         }
         finally
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
         }
-        return sb.ToString();
     }
 
-    private sealed class BodyTooLargeException : Exception { }
+    private sealed class BodyTooLargeException : Exception 
+    {
+        public BodyTooLargeException(string message): base(message) { }
+    }
 }
