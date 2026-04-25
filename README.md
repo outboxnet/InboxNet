@@ -556,17 +556,17 @@ Single-node run on `(localdb)\MSSQLLocalDB`, default visibility timeout, no fail
 
 | Metric | Value |
 |---|---|
-| Messages | 1,000 |
-| Publish throughput | **924 msg/s** |
-| Handler throughput | **840 msg/s** |
-| Latency — min | 11 ms |
-| Latency — p50 | **38 ms** |
-| Latency — p95 | 256 ms |
-| Latency — p99 | 569 ms |
-| Latency — max | 589 ms |
+| Messages | 5,000 |
+| Publish throughput | **1,876 msg/s** |
+| Handler throughput | **1,618 msg/s** |
+| Latency — min | 8 ms |
+| Latency — p50 | **321 ms** |
+| Latency — p95 | 461 ms |
+| Latency — p99 | 520 ms |
+| Latency — max | 632 ms |
 | Correctness | 0 lost, 0 duplicates, 0 unexpected |
 
-The pipeline floor is **11 ms** end-to-end (HTTP ingress → DB INSERT → channel signal → batch lock → dispatch → handler). Handler throughput tracks publish throughput within ~10%, so the dispatcher keeps up with arrival and the queue does not grow unbounded; the long-tail latencies (p95, p99) reflect transient batches landing on a momentarily-full dispatcher rather than systemic backlog.
+The pipeline floor is **8 ms** end-to-end (HTTP ingress → DB INSERT → channel signal → batch lock → dispatch → handler). At 5,000 messages the publisher outpaces the dispatcher by ~260 msg/s for the duration of the publish phase, so a small steady-state queue forms and the p50 reflects average queue wait under sustained load rather than the empty-pipeline floor; p95/p99 stay tight because the queue never grows unbounded and drains within ~400 ms after the last publish.
 
 For comparison, the same workload with full-forensics defaults (`BulkBookkeeping=false`, `RecordAttemptsOnSuccess=true`) measured **155 msg/s** handler throughput and **p50 = 11.2 s** — the difference is the per-message round-trip count dropping from ~3 to ~1 plus the bulk processed-status UPDATE being amortised across the batch.
 
