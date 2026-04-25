@@ -23,8 +23,10 @@ public sealed class ExponentialBackoffInboxRetryPolicy : IInboxRetryPolicy
         var baseDelayMs = _options.BaseDelay.TotalMilliseconds * Math.Pow(2, retryCount);
         var cappedDelayMs = Math.Min(baseDelayMs, _options.MaxDelay.TotalMilliseconds);
 
-        var jitter = cappedDelayMs * _options.JitterFactor * (Random.Shared.NextDouble() * 2 - 1);
-        var finalDelayMs = Math.Max(0, cappedDelayMs + jitter);
+        // Multiplicative jitter clamped to [0, 1] keeps the result in [0, 2 × cappedDelay]
+        // — never negative regardless of the configured factor.
+        var jitter = _options.ClampedJitterFactor * (Random.Shared.NextDouble() * 2 - 1);
+        var finalDelayMs = cappedDelayMs * (1 + jitter);
 
         return TimeSpan.FromMilliseconds(finalDelayMs);
     }

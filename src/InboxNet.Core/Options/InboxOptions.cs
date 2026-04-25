@@ -10,11 +10,18 @@ public class InboxOptions
     /// <summary>
     /// How long a locked inbox message is invisible to other dispatcher instances.
     /// Must exceed worst-case per-message dispatch time (sum of all handler timeouts × sequential).
-    /// Default: 5 minutes.
+    /// Default: 10 minutes — leaves headroom over the default retry policy's 5-minute cap so
+    /// a slow handler doesn't lose its lock mid-dispatch.
     /// </summary>
-    public TimeSpan DefaultVisibilityTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    public TimeSpan DefaultVisibilityTimeout { get; set; } = TimeSpan.FromMinutes(10);
 
-    public string InstanceId { get; set; } = $"{Environment.MachineName}-{Guid.NewGuid():N}";
+    /// <summary>
+    /// Stable identity for this instance, written to the <c>LockedBy</c> column. Default
+    /// resolution order: KUBERNETES_POD_NAME → WEBSITE_INSTANCE_ID → COMPUTERNAME →
+    /// "{MachineName}-{ProcessId}". The default is deterministic per pod so post-mortem
+    /// queries can correlate locks with infrastructure state.
+    /// </summary>
+    public string InstanceId { get; set; } = ResolveInstanceId();
 
     /// <summary>How many inbox messages are dispatched concurrently within a single batch. Default: 10.</summary>
     public int MaxConcurrentDispatch { get; set; } = 10;
@@ -57,4 +64,32 @@ public class InboxOptions
     /// is naturally idempotent. Default: <c>true</c>.
     /// </summary>
     public bool RecordHandlerAttempts { get; set; } = true;
+
+    /// <summary>
+    /// Maximum allowed webhook request body size in bytes. Requests larger than this are
+    /// rejected with HTTP 413. Default: 1 MB. Applies to <c>MapInboxWebhooks</c>; the Azure
+    /// Functions host enforces its own limits.
+    /// </summary>
+    public long MaxBodyBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>
+    /// When <c>true</c>, ContentSha256 is computed on every received webhook regardless of
+    /// whether the provider supplied an event ID. When <c>false</c> (default), the SHA is
+    /// only computed when no event ID is available — the dedup key falls back to the SHA
+    /// in that case. Skips one allocation + hash for providers that always supply an event ID.
+    /// </summary>
+    public bool AlwaysComputeContentSha256 { get; set; } = false;
+
+    private static string ResolveInstanceId()
+    {
+        var pod = Environment.GetEnvironmentVariable("KUBERNETES_POD_NAME");
+        if (!string.IsNullOrWhiteSpace(pod)) return pod;
+
+        var azureSlot = Environment.GetEnvironmentVariable("WEBSITE_INSTANCE_ID");
+        if (!string.IsNullOrWhiteSpace(azureSlot)) return azureSlot;
+
+        var machine = Environment.MachineName;
+        var pid = Environment.ProcessId;
+        return $"{machine}-{pid}";
+    }
 }

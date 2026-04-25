@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Options;
 using InboxNet.Interfaces;
 using InboxNet.Models;
+using InboxNet.Options;
 
 namespace InboxNet.Providers.Generic;
 
@@ -16,14 +18,18 @@ public sealed class GenericHmacWebhookProvider : IWebhookProvider
 {
     private readonly GenericHmacWebhookOptions _options;
     private readonly byte[] _signingKey;
+    private readonly bool _alwaysComputeSha;
 
-    public GenericHmacWebhookProvider(GenericHmacWebhookOptions options)
+    public GenericHmacWebhookProvider(
+        GenericHmacWebhookOptions options,
+        IOptions<InboxOptions> inboxOptions)
     {
         _options = options;
         if (string.IsNullOrWhiteSpace(_options.Secret))
             throw new InvalidOperationException(
                 $"GenericHmacWebhookOptions.Secret must be set for provider '{_options.Key}'.");
         _signingKey = Encoding.UTF8.GetBytes(_options.Secret);
+        _alwaysComputeSha = inboxOptions.Value.AlwaysComputeContentSha256;
     }
 
     public string Key => _options.Key;
@@ -102,7 +108,8 @@ public sealed class GenericHmacWebhookProvider : IWebhookProvider
             ? tid
             : null;
 
-        var contentSha = WebhookSignatureHelpers.ComputeContentSha256(rawBody);
+        var contentSha = WebhookSignatureHelpers.ComputeContentSha256IfNeeded(
+            rawBody, providerEventId, _alwaysComputeSha);
 
         return Task.FromResult(WebhookParseResult.Valid(
             eventType: eventType!,

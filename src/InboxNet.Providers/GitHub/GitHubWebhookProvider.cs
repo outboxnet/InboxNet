@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Options;
 using InboxNet.Interfaces;
 using InboxNet.Models;
+using InboxNet.Options;
 
 namespace InboxNet.Providers.GitHub;
 
@@ -25,13 +26,17 @@ public sealed class GitHubWebhookProvider : IWebhookProvider
 
     private readonly GitHubWebhookOptions _options;
     private readonly byte[] _signingKey;
+    private readonly bool _alwaysComputeSha;
 
-    public GitHubWebhookProvider(IOptions<GitHubWebhookOptions> options)
+    public GitHubWebhookProvider(
+        IOptions<GitHubWebhookOptions> options,
+        IOptions<InboxOptions> inboxOptions)
     {
         _options = options.Value;
         if (string.IsNullOrWhiteSpace(_options.Secret))
             throw new InvalidOperationException("GitHubWebhookOptions.Secret must be set.");
         _signingKey = Encoding.UTF8.GetBytes(_options.Secret);
+        _alwaysComputeSha = inboxOptions.Value.AlwaysComputeContentSha256;
     }
 
     public string Key => _options.Key;
@@ -86,7 +91,8 @@ public sealed class GitHubWebhookProvider : IWebhookProvider
             return Task.FromResult(WebhookParseResult.Invalid("Body is not valid JSON"));
         }
 
-        var contentSha = WebhookSignatureHelpers.ComputeContentSha256(rawBody);
+        var contentSha = WebhookSignatureHelpers.ComputeContentSha256IfNeeded(
+            rawBody, deliveryId, _alwaysComputeSha);
 
         return Task.FromResult(WebhookParseResult.Valid(
             eventType: eventType.ToString(),

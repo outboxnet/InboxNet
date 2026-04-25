@@ -4,9 +4,11 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using InboxNet.Interfaces;
 using InboxNet.Models;
 using InboxNet.Observability;
+using InboxNet.Options;
 
 namespace InboxNet.AspNetCore;
 
@@ -14,8 +16,9 @@ public static class InboxEndpointRouteBuilderExtensions
 {
     /// <summary>
     /// Maps a POST endpoint that receives webhooks for a single provider. The raw request
-    /// body is buffered once, handed to the provider's <see cref="IWebhookProvider.ParseAsync"/>
-    /// for validation, then persisted via <see cref="IInboxPublisher"/>.
+    /// body is buffered once (capped by <see cref="InboxOptions.MaxBodyBytes"/>), handed to
+    /// the provider's <see cref="IWebhookProvider.ParseAsync"/> for validation, then
+    /// persisted via <see cref="IInboxPublisher"/>.
     /// <para>
     /// Response codes:
     /// <list type="bullet">
@@ -23,6 +26,7 @@ public static class InboxEndpointRouteBuilderExtensions
     /// <item><description><c>200 OK</c> — duplicate of an already-received message (idempotent replay)</description></item>
     /// <item><description><c>400 Bad Request</c> — provider rejected the request (bad signature, malformed body, etc.)</description></item>
     /// <item><description><c>404 Not Found</c> — no provider is registered under that key</description></item>
+    /// <item><description><c>413 Payload Too Large</c> — body exceeded <see cref="InboxOptions.MaxBodyBytes"/></description></item>
     /// </list>
     /// </para>
     /// </summary>
@@ -56,6 +60,7 @@ public static class InboxEndpointRouteBuilderExtensions
         var sp = context.RequestServices;
         var registry = sp.GetRequiredService<IWebhookProviderRegistry>();
         var publisher = sp.GetRequiredService<IInboxPublisher>();
+        var inboxOptions = sp.GetRequiredService<IOptions<InboxOptions>>().Value;
         var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("InboxNet.Webhook");
 
         var provider = registry.Get(providerKey);
@@ -68,15 +73,35 @@ public static class InboxEndpointRouteBuilderExtensions
         using var activity = InboxActivitySource.Source.StartActivity("inbox.receive");
         activity?.SetTag("inbox.provider_key", providerKey);
 
-        // Buffer the body once. Providers need the raw bytes for signature verification
-        // and for computing a content SHA — re-reading request.Body is not safe.
+        // Reject early when Content-Length is present and over the limit — saves the
+        // upload of a payload we'd refuse anyway.
+        var maxBodyBytes = inboxOptions.MaxBodyBytes;
+        if (context.Request.ContentLength is long declaredLen && declaredLen > maxBodyBytes)
+        {
+            logger.LogWarning(
+                "Webhook for provider {ProviderKey} declared body length {Length} > limit {Limit}",
+                providerKey, declaredLen, maxBodyBytes);
+            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        }
+
+        // Buffer the body once with an enforced upper bound. Providers need the raw bytes
+        // for signature verification; re-reading request.Body is not safe.
         string rawBody;
         try
         {
-            context.Request.EnableBuffering();
-            using var reader = new StreamReader(context.Request.Body, Encoding.UTF8, leaveOpen: true);
-            rawBody = await reader.ReadToEndAsync(context.RequestAborted);
+            // bufferThreshold = bytes kept in memory before spooling to disk.
+            // bufferLimit = absolute maximum; reads above this throw.
+            var bufferThreshold = (int)Math.Min(maxBodyBytes, 64 * 1024);
+            context.Request.EnableBuffering(bufferThreshold, maxBodyBytes);
+            rawBody = await ReadBoundedAsync(context.Request.Body, maxBodyBytes, context.RequestAborted);
             context.Request.Body.Position = 0;
+        }
+        catch (BodyTooLargeException)
+        {
+            logger.LogWarning(
+                "Webhook for provider {ProviderKey} exceeded body size limit {Limit} during read",
+                providerKey, maxBodyBytes);
+            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -126,5 +151,75 @@ public static class InboxEndpointRouteBuilderExtensions
         }
 
         return Results.Accepted(value: new { messageId = result.MessageId });
+    }
+
+    /// <summary>
+    /// Reads the stream as UTF-8 text with a size limit.
+    /// </summary>
+    /// <param name="body">Stream to read from (not disposed)</param>
+    /// <param name="maxBytes">Maximum allowed bytes</param>
+    /// <param name="ct">Cancellation token</param>
+    /// <returns>Decoded string</returns>
+    /// <exception cref="BodyTooLargeException">
+    /// Thrown when stream exceeds maxBytes
+    /// </exception>
+    private static async Task<string> ReadBoundedAsync(
+        Stream body,
+        long maxBytes,
+        CancellationToken ct)
+    {
+        if (maxBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxBytes));
+
+        // Use MemoryStream as a safe accumulator for small/medium payloads
+        // This is surprisingly efficient for typical webhooks (<100KB)
+        using var memoryStream = new MemoryStream();
+
+        const int bufferSize = 81920; // 80KB - optimal for network streams
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+
+        try
+        {
+            long totalBytes = 0;
+            int bytesRead;
+
+            while ((bytesRead = await body.ReadAsync(
+                buffer.AsMemory(0, bufferSize), ct).ConfigureAwait(false)) > 0)
+            {
+                totalBytes += bytesRead;
+
+                if (totalBytes > maxBytes)
+                {
+                    throw new BodyTooLargeException(
+                        $"Request body exceeds {maxBytes} bytes. " +
+                        $"Read {totalBytes} bytes before aborting.");
+                }
+
+                await memoryStream.WriteAsync(
+                    buffer.AsMemory(0, bytesRead), ct).ConfigureAwait(false);
+            }
+
+            // Seek to beginning for reading
+            memoryStream.Position = 0;
+
+            // Now decode everything at once - correctly handles UTF-8
+            using var reader = new StreamReader(
+                memoryStream,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: false,
+                bufferSize: 4096,
+                leaveOpen: false);
+
+            return await reader.ReadToEndAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private sealed class BodyTooLargeException : Exception 
+    {
+        public BodyTooLargeException(string message): base(message) { }
     }
 }

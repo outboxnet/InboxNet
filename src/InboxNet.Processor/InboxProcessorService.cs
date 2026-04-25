@@ -8,10 +8,11 @@ using InboxNet.Options;
 namespace InboxNet.Processor;
 
 /// <summary>
-/// Inbox dispatcher hosted service. Runs a hot path (drains the in-process signal channel for
-/// sub-millisecond same-instance dispatch) and a cold path (periodic batch scan for
-/// cross-instance messages, retries, and overflow recovery). Same architecture as the outbox
-/// processor; the DB lock gate guarantees at-most-once dispatch across replicas.
+/// Inbox dispatcher hosted service. Runs a hot path (drains the in-process signal channel,
+/// coalesces arrivals into a small batch, and dispatches them in one round-trip for
+/// sub-millisecond same-instance latency) and a cold path (adaptive batch scan for
+/// cross-instance messages, retries, and overflow recovery). The DB lock gate guarantees
+/// at-most-once dispatch across replicas.
 /// </summary>
 public sealed class InboxProcessorService : BackgroundService
 {
@@ -43,42 +44,105 @@ public sealed class InboxProcessorService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "Inbox dispatcher started. Cold polling interval: {Interval}ms, MaxConcurrentDispatch: {Max}",
+            "Inbox dispatcher started. Cold polling: {Min}ms..{Max}ms, hot batch: {BatchSize}/{WindowMs}ms, MaxConcurrentDispatch: {Max}",
             _processorOptions.ColdPollingInterval.TotalMilliseconds,
+            _processorOptions.ColdMaxPollingInterval.TotalMilliseconds,
+            _processorOptions.HotPathBatchSize,
+            _processorOptions.HotPathBatchWindow.TotalMilliseconds,
             _inboxOptions.MaxConcurrentDispatch);
 
-        await Task.WhenAll(
-            RunHotPathAsync(stoppingToken),
-            RunColdPathAsync(stoppingToken));
+        // Both loops are essential. If either one exits — normally on shutdown or due to a
+        // terminal failure — cancel the survivor so the host sees a single deterministic stop
+        // rather than the service silently degrading to one path.
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var hot = RunHotPathAsync(loopCts.Token);
+        var cold = RunColdPathAsync(loopCts.Token);
+
+        var first = await Task.WhenAny(hot, cold);
+        if (first.IsFaulted && !stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogError(first.Exception,
+                "Inbox dispatcher loop terminated unexpectedly — stopping the survivor");
+        }
+        loopCts.Cancel();
+
+        try
+        {
+            await Task.WhenAll(hot, cold);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected once we cancel the survivor.
+        }
     }
 
     private async Task RunHotPathAsync(CancellationToken ct)
     {
+        var batchSize = Math.Max(1, _processorOptions.HotPathBatchSize);
+        var window = _processorOptions.HotPathBatchWindow;
+        var reader = _signal.Reader;
+        var batch = new List<Guid>(batchSize);
+
         try
         {
-            await Parallel.ForEachAsync(
-                _signal.Reader.ReadAllAsync(ct),
-                new ParallelOptions
+            while (await reader.WaitToReadAsync(ct))
+            {
+                batch.Clear();
+
+                // First read is mandatory — we wouldn't have unblocked otherwise.
+                if (!reader.TryRead(out var first))
+                    continue;
+                batch.Add(first);
+                _hotInFlight.TryAdd(first, 0);
+
+                // Greedy drain of anything already buffered.
+                while (batch.Count < batchSize && reader.TryRead(out var id))
                 {
-                    MaxDegreeOfParallelism = _inboxOptions.MaxConcurrentDispatch,
-                    CancellationToken = ct
-                },
-                async (messageId, token) =>
+                    batch.Add(id);
+                    _hotInFlight.TryAdd(id, 0);
+                }
+
+                // If the batch isn't full, wait briefly for more arrivals to coalesce. The
+                // window bounds dispatch latency at low arrival rates.
+                if (batch.Count < batchSize && window > TimeSpan.Zero)
                 {
-                    _hotInFlight.TryAdd(messageId, 0);
+                    using var windowCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    windowCts.CancelAfter(window);
                     try
                     {
-                        await _processor.TryProcessByIdAsync(messageId, token);
+                        while (batch.Count < batchSize && await reader.WaitToReadAsync(windowCts.Token))
+                        {
+                            while (batch.Count < batchSize && reader.TryRead(out var id))
+                            {
+                                batch.Add(id);
+                                _hotInFlight.TryAdd(id, 0);
+                            }
+                        }
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                     {
-                        _logger.LogError(ex, "Hot-path inbox dispatch failed for message {MessageId}", messageId);
+                        // Window elapsed — flush what we have.
                     }
-                    finally
-                    {
-                        _hotInFlight.TryRemove(messageId, out _);
-                    }
-                });
+                }
+
+                try
+                {
+                    if (batch.Count == 1)
+                        await _processor.TryProcessByIdAsync(batch[0], ct);
+                    else
+                        await _processor.TryProcessByIdsAsync(batch, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogError(ex,
+                        "Hot-path inbox dispatch failed for {Count} message(s)", batch.Count);
+                }
+                finally
+                {
+                    foreach (var id in batch)
+                        _hotInFlight.TryRemove(id, out _);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
@@ -88,14 +152,22 @@ public sealed class InboxProcessorService : BackgroundService
 
     private async Task RunColdPathAsync(CancellationToken ct)
     {
+        var minInterval = _processorOptions.ColdPollingInterval;
+        var maxInterval = _processorOptions.ColdMaxPollingInterval;
+        // Guard against misconfiguration (max < min).
+        if (maxInterval < minInterval) maxInterval = minInterval;
+
+        var currentInterval = minInterval;
+
         while (!ct.IsCancellationRequested)
         {
+            var processed = 0;
             try
             {
                 var skipIds = _hotInFlight.IsEmpty
                     ? null
                     : new HashSet<Guid>(_hotInFlight.Keys);
-                await _processor.ProcessBatchAsync(ct, skipIds);
+                processed = await _processor.ProcessBatchAsync(ct, skipIds);
             }
             catch (OperationCanceledException)
             {
@@ -106,9 +178,20 @@ public sealed class InboxProcessorService : BackgroundService
                 _logger.LogError(ex, "Cold-path inbox dispatch batch failed");
             }
 
+            // Adaptive backoff: any work resets to the minimum; idle scans double up to max.
+            if (processed > 0)
+            {
+                currentInterval = minInterval;
+            }
+            else if (currentInterval < maxInterval)
+            {
+                var doubledTicks = Math.Min(currentInterval.Ticks * 2, maxInterval.Ticks);
+                currentInterval = TimeSpan.FromTicks(Math.Max(doubledTicks, minInterval.Ticks));
+            }
+
             try
             {
-                await Task.Delay(_processorOptions.ColdPollingInterval, ct);
+                await Task.Delay(currentInterval, ct);
             }
             catch (OperationCanceledException)
             {

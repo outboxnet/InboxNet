@@ -15,30 +15,18 @@ public static class ServiceCollectionExtensions
         this IServiceCollection services,
         Action<InboxOptions>? configure = null)
     {
-        var options = new InboxOptions();
-        configure?.Invoke(options);
+        // Use the options pipeline directly so multiple Configure calls and
+        // IConfiguration.Bind callers compose normally.
+        var optionsBuilder = services.AddOptions<InboxOptions>();
+        if (configure is not null) optionsBuilder.Configure(configure);
 
-        services.Configure<InboxOptions>(o =>
-        {
-            o.SchemaName = options.SchemaName;
-            o.BatchSize = options.BatchSize;
-            o.DefaultVisibilityTimeout = options.DefaultVisibilityTimeout;
-            o.InstanceId = options.InstanceId;
-            o.MaxConcurrentDispatch = options.MaxConcurrentDispatch;
-            o.EnableOrderedProcessing = options.EnableOrderedProcessing;
-            o.TenantFilter = options.TenantFilter;
-            o.BulkBookkeeping = options.BulkBookkeeping;
-            o.RecordAttemptsOnSuccess = options.RecordAttemptsOnSuccess;
-            o.RecordHandlerAttempts = options.RecordHandlerAttempts;
-        });
-
-        services.Configure<InboxRetryPolicyOptions>(_ => { });
+        services.AddOptions<InboxRetryPolicyOptions>();
 
         services.AddSingleton<IInboxSignal, ChannelInboxSignal>();
-        // Scoped: providers registered via AddProvider<TValidator, TMapper>() are scoped
-        // (their validator/mapper dependencies may be scoped, e.g. inject DbContext).
-        // A scoped registry can enumerate both singleton and scoped providers.
-        services.AddScoped<IWebhookProviderRegistry, WebhookProviderRegistry>();
+        // Singleton: the registry is built once from the singleton provider list.
+        // Composite providers that need scoped collaborators resolve them per-request
+        // from the IServiceScopeFactory passed into ParseAsync.
+        services.AddSingleton<IWebhookProviderRegistry, WebhookProviderRegistry>();
         services.AddSingleton<IInboxHandlerRegistry, InboxHandlerRegistry>();
         services.TryAddSingleton<IInboxRetryPolicy, ExponentialBackoffInboxRetryPolicy>();
 
@@ -53,17 +41,7 @@ public static class ServiceCollectionExtensions
         this IInboxNetBuilder builder,
         Action<InboxRetryPolicyOptions> configure)
     {
-        var opts = new InboxRetryPolicyOptions();
-        configure(opts);
-
-        builder.Services.Configure<InboxRetryPolicyOptions>(o =>
-        {
-            o.MaxRetries = opts.MaxRetries;
-            o.BaseDelay = opts.BaseDelay;
-            o.MaxDelay = opts.MaxDelay;
-            o.JitterFactor = opts.JitterFactor;
-        });
-
+        builder.Services.Configure<InboxRetryPolicyOptions>(configure);
         return builder;
     }
 
@@ -110,13 +88,13 @@ public static class ServiceCollectionExtensions
         builder.Services.AddKeyedScoped<IWebhookSignatureValidator, TValidator>(providerKey);
         builder.Services.AddKeyedScoped<IWebhookPayloadMapper, TMapper>(providerKey);
 
-        // Scoped composite: captures the scoped validator and mapper so either can inject
-        // per-request services (DbContext, tenant-resolved options, etc.).
-        builder.Services.AddScoped<IWebhookProvider>(sp =>
+        // Singleton composite that resolves its scoped collaborators per request from
+        // an IServiceScopeFactory. Keeps the singleton registry usable while still letting
+        // validators/mappers inject scoped services (DbContext etc.).
+        builder.Services.AddSingleton<IWebhookProvider>(sp =>
             new CompositeWebhookProvider(
                 providerKey,
-                sp.GetRequiredKeyedService<IWebhookSignatureValidator>(providerKey),
-                sp.GetRequiredKeyedService<IWebhookPayloadMapper>(providerKey)));
+                sp.GetRequiredService<IServiceScopeFactory>()));
 
         return builder;
     }
