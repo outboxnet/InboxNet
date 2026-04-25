@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using InboxNet.Models;
 
@@ -32,9 +33,24 @@ public class InboxMessageConfiguration : IEntityTypeConfiguration<InboxMessage>
         builder.Property(m => m.CorrelationId).HasMaxLength(128);
         builder.Property(m => m.TraceId).HasMaxLength(128);
 
-        builder.Property(m => m.Headers).HasConversion(
-            v => v == null ? null : JsonSerializer.Serialize(v, (JsonSerializerOptions?)null),
-            v => v == null ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(v, (JsonSerializerOptions?)null));
+        // ValueComparer is required when the converted property is a reference-type
+        // collection — without it EF compares by reference and would miss in-place mutations
+        // (headers["x"] = "y" wouldn't mark the entity dirty). Snapshot deep-copies so the
+        // change tracker's original-values snapshot doesn't alias the live dictionary.
+        var headersComparer = new ValueComparer<Dictionary<string, string>?>(
+            (a, b) => ReferenceEquals(a, b) ||
+                      (a != null && b != null && a.Count == b.Count &&
+                       !a.Except(b).Any()),
+            v => v == null
+                ? 0
+                : v.Aggregate(0, (h, kv) => HashCode.Combine(h, kv.Key, kv.Value)),
+            v => v == null ? null : new Dictionary<string, string>(v));
+
+        builder.Property(m => m.Headers)
+            .HasConversion(
+                v => v == null ? null : JsonSerializer.Serialize(v, (JsonSerializerOptions?)null),
+                v => v == null ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(v, (JsonSerializerOptions?)null))
+            .Metadata.SetValueComparer(headersComparer);
 
         builder.Property(m => m.TenantId).HasMaxLength(256);
         builder.Property(m => m.EntityId).HasMaxLength(256);

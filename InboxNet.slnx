@@ -10,5 +10,7 @@
     <Project Path="src/InboxNet.Processor/InboxNet.Processor.csproj" />
     <Project Path="src/InboxNet.Providers/InboxNet.Providers.csproj" />
   </Folder>
-  <Folder Name="/tests/" />
+  <Folder Name="/tests/">
+    <Project Path="tests/InboxNet.LoadTests/InboxNet.LoadTests.csproj" />
+  </Folder>
 </Solution>

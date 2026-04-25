@@ -37,6 +37,18 @@ public interface IInboxStore
 
     Task<bool> MarkAsProcessedAsync(Guid messageId, string lockedBy, CancellationToken ct = default);
 
+    /// <summary>
+    /// Bulk variant of <see cref="MarkAsProcessedAsync"/>. Marks every supplied id as
+    /// <see cref="InboxMessageStatus.Processed"/> in a single round-trip, scoped by
+    /// <paramref name="lockedBy"/> so a stale lock cannot complete someone else's work.
+    /// Returns the number of rows updated — may be less than <paramref name="messageIds"/>
+    /// when some locks expired during dispatch.
+    /// </summary>
+    Task<int> MarkAsProcessedBulkAsync(
+        IReadOnlyCollection<Guid> messageIds,
+        string lockedBy,
+        CancellationToken ct = default);
+
     Task<bool> IncrementRetryAsync(
         Guid messageId,
         string lockedBy,

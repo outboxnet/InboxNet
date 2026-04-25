@@ -27,6 +27,9 @@ public static class ServiceCollectionExtensions
             o.MaxConcurrentDispatch = options.MaxConcurrentDispatch;
             o.EnableOrderedProcessing = options.EnableOrderedProcessing;
             o.TenantFilter = options.TenantFilter;
+            o.BulkBookkeeping = options.BulkBookkeeping;
+            o.RecordAttemptsOnSuccess = options.RecordAttemptsOnSuccess;
+            o.RecordHandlerAttempts = options.RecordHandlerAttempts;
         });
 
         services.Configure<InboxRetryPolicyOptions>(_ => { });

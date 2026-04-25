@@ -32,4 +32,29 @@ public class InboxOptions
     /// dispatched by this instance. Null (default) = all tenants.
     /// </summary>
     public string? TenantFilter { get; set; }
+
+    /// <summary>
+    /// When true, the dispatcher batches per-message bookkeeping writes (mark-as-processed
+    /// UPDATE plus handler-attempt INSERTs) into one round-trip per dispatch batch rather
+    /// than per message. Trades a small increase in blast radius on a dispatcher crash —
+    /// a whole batch's locks must expire before retry, instead of one message's — for a
+    /// significant cut in per-message DB round-trips. Default: <c>true</c>.
+    /// </summary>
+    public bool BulkBookkeeping { get; set; } = true;
+
+    /// <summary>
+    /// When <c>false</c>, handler-attempt rows are written only on failure or dead-letter,
+    /// not on success. Saves one INSERT per message on the happy path; the trade-off is
+    /// loss of success-side forensics (timing, attempt count). Default: <c>true</c>.
+    /// </summary>
+    public bool RecordAttemptsOnSuccess { get; set; } = true;
+
+    /// <summary>
+    /// When <c>false</c>, the handler-attempt store is bypassed entirely — no prior-state
+    /// SELECT and no INSERTs. The pipeline re-runs every registered handler on every
+    /// dispatch, so handlers MUST be idempotent on <see cref="Models.InboxMessage.Id"/>.
+    /// Use only when you have at most one handler per (provider, event) and that handler
+    /// is naturally idempotent. Default: <c>true</c>.
+    /// </summary>
+    public bool RecordHandlerAttempts { get; set; } = true;
 }

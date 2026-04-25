@@ -50,6 +50,8 @@ Persisting the message in the same database that your handlers write to gives yo
 - **Hot + cold dispatch paths** — same-instance messages drain a `Channel<Guid>` for sub-millisecond latency; cross-instance messages are caught by the cold-path batch scan
 - **Multi-instance safe** — DB-level `UPDATE WHERE Status=Pending` is the lock gate; exactly one instance wins per message
 - **Ordered processing** — messages with the same `(TenantId, ProviderKey, EntityId)` are dispatched in arrival order
+- **Tunable bookkeeping** — opt-in batched flushes and selectable attempt-recording modes for high-throughput workloads (see [Performance](#performance))
+- **Deadlock-tolerant** — `EnableRetryOnFailure` on by default; SQL Server 1205 victims are retried transparently
 - **Provider model** — validate and parse each provider's signature scheme once, independently of handler logic
 - **Built-in providers** — Stripe (v1 HMAC scheme), GitHub (X-Hub-Signature-256), Generic HMAC-SHA256
 - **Observability** — built-in OpenTelemetry `ActivitySource` and `System.Diagnostics.Metrics`
@@ -348,6 +350,14 @@ Each handler's outcome is stored in `InboxHandlerAttempts` as a separate row. Wh
 - Handler A succeeds, Handler B fails → retry runs Handler B only
 - If attempt records cannot be saved after a successful handler run, the lock is left to expire rather than immediately retrying — this avoids re-running handlers that actually succeeded
 
+Three options on `InboxOptions` let you trade forensics for throughput:
+
+- `BulkBookkeeping` (default `true`) — flush attempt INSERTs and processed-status UPDATEs once per batch instead of once per message.
+- `RecordAttemptsOnSuccess` (default `true`) — when `false`, only failed attempts leave a row.
+- `RecordHandlerAttempts` (default `true`) — when `false`, the attempt store is bypassed entirely; handlers re-run on every dispatch and must be idempotent on `InboxMessage.Id`.
+
+See the [Performance](#performance) section for the throughput impact of each.
+
 ### Multi-instance safety
 
 All instances share the same SQL Server database. The lock acquisition uses:
@@ -392,7 +402,54 @@ services.AddInboxNet(options =>
 
     // Only dispatch messages for this tenant. Null = all tenants (default).
     options.TenantFilter = null;
+
+    // ── Bookkeeping ────────────────────────────────────────────────────────
+    // Trade-off knobs for per-message database round-trips on the dispatch
+    // happy path. Defaults preserve full forensics; tighten them for throughput.
+
+    // Flush attempt INSERTs and mark-as-processed UPDATEs once per dispatch
+    // batch instead of per message. Cuts ~2 round-trips off the per-message
+    // critical path. On a dispatcher crash mid-batch the affected messages
+    // stay locked until visibility timeout expires (same at-least-once
+    // semantics, wider blast radius). Default: true
+    options.BulkBookkeeping = true;
+
+    // Write attempt rows on success. Set false to write attempts only for
+    // failures — saves one INSERT per message on the happy path; trade-off
+    // is loss of success-side forensics (timing, attempt count). Default: true
+    options.RecordAttemptsOnSuccess = true;
+
+    // Use the attempt store at all. When false, the prior-state SELECT and
+    // all attempt INSERTs are skipped; handlers re-run on every dispatch and
+    // MUST be idempotent on InboxMessage.Id. Use only when there is at most
+    // one handler per (provider, event) and that handler is naturally
+    // idempotent. Default: true
+    options.RecordHandlerAttempts = true;
 });
+```
+
+### `.UseSqlServer(connectionString, options => ...)`
+
+```csharp
+.UseSqlServer(connectionString, options =>
+{
+    // The assembly that owns inbox migrations. Default: assembly containing
+    // the registered DbContext (which for the library is InboxNet.EntityFrameworkCore;
+    // when you ship migrations from your own assembly, set this explicitly).
+    options.MigrationsAssembly = typeof(Program).Assembly.FullName;
+
+    // EF Core transient-error retry. Catches SQL Server deadlocks (1205) plus
+    // the standard set of connection / availability errors. Strongly recommended
+    // for production — concurrent batch-lock UPDATEs and receive-side INSERTs
+    // can deadlock on the candidate index at high throughput. Default: true
+    options.EnableRetryOnFailure = true;
+
+    // Default: 5
+    options.MaxRetryCount = 5;
+
+    // Default: 5 seconds
+    options.MaxRetryDelay = TimeSpan.FromSeconds(5);
+})
 ```
 
 ### `.AddBackgroundDispatcher(options => ...)`
@@ -459,6 +516,82 @@ builder.Services.AddOpenTelemetry()
 | `inbox.batch.size` | Histogram | — |
 | `inbox.processing.duration_ms` | Histogram | — |
 
+## Performance
+
+InboxNet ships with a load test (`tests/InboxNet.LoadTests`) that exercises the full pipeline end-to-end: HMAC-signed HTTP webhooks → ASP.NET Core receive endpoint → SQL Server persistence → background dispatcher → `IInboxHandler`. It measures **receive-to-handler-completion** latency (not just dispatch latency) and reports throughput, percentile latencies, and correctness counters (lost / duplicate / unexpected handled).
+
+Run it from Visual Studio (F5) or:
+
+```bash
+dotnet run --project tests/InboxNet.LoadTests -c Release
+```
+
+All knobs live in `appsettings.json`:
+
+```json
+"LoadTest": {
+  "TotalMessages": 5000,
+  "PublisherConcurrency": 20,
+  "BatchSize": 200,
+  "MaxConcurrentDispatch": 50,
+  "ColdPollingIntervalMs": 200,
+  "BulkBookkeeping": true,
+  "RecordAttemptsOnSuccess": false,
+  "RecordHandlerAttempts": true
+}
+```
+
+### Reference result — LocalDB baseline
+
+Single-node run on `(localdb)\MSSQLLocalDB`, default visibility timeout, no failure injection, no-op handler. Default safety-first configuration (`BulkBookkeeping=false`, `RecordAttemptsOnSuccess=true`, `RecordHandlerAttempts=true`):
+
+| Metric | Value |
+|---|---|
+| Messages | 5,000 |
+| Publish throughput | 236 msg/s |
+| Handler throughput | 155 msg/s |
+| Latency — p50 | 11.2 s |
+| Latency — p95 | 11.5 s |
+| Latency — p99 | 11.6 s |
+| Latency — min | 305 ms |
+| Correctness | 0 lost, 0 duplicates, 0 unexpected |
+
+The high p50 reflects queue-wait, not handler cost: the publisher (236 msg/s) outruns the dispatcher (155 msg/s) so a backlog grows during the publish phase and drains afterward. The `min = 305 ms` is the floor — that's a single message's full pipeline cost when the queue is empty (HTTP ingress → DB INSERT → channel signal → batch lock → dispatch → handler). All 5,000 messages were handled exactly once with no duplicates or losses.
+
+### Tuning levers
+
+The throughput ceiling on LocalDB is dominated by per-message DB round-trips. Three options on `InboxOptions` reduce that ceiling:
+
+| Option | Default | Effect when changed |
+|---|---|---|
+| `BulkBookkeeping` | `true` | When false: per-message UPDATE + INSERT. When true (default): batched flush per dispatch batch. ~2 fewer round-trips per message. |
+| `RecordAttemptsOnSuccess` | `true` | When false: skip attempt INSERTs on the happy path (failures still recorded). Saves one INSERT per success. Loses success-side forensics. |
+| `RecordHandlerAttempts` | `true` | When false: bypass the attempt store entirely (no SELECT, no INSERT). Handlers re-run on every dispatch — they must be idempotent on `InboxMessage.Id`. |
+
+Recommended ladder, in order of correctness-vs-speed trade-off:
+
+1. **Default** — full forensics, every attempt is durable. Use in production until you measure it as a bottleneck.
+2. **`BulkBookkeeping=true, RecordAttemptsOnSuccess=false`** — only failures get attempt rows. Acceptable for most production workloads; you still get full visibility into anything that went wrong.
+3. **`RecordHandlerAttempts=false`** — for high-throughput tenants with naturally idempotent single-handler events. The dispatcher becomes effectively stateless on the happy path.
+
+`MaxConcurrentDispatch` and `BatchSize` control parallelism; `EnableRetryOnFailure` (on by default) absorbs deadlocks at high concurrency without surfacing them to your code.
+
+### Expected production throughput
+
+LocalDB serializes log writes aggressively and is not representative of production SQL Server. With the same workload the rough ceilings on real database backends are:
+
+| Backend | Handler throughput | Notes |
+|---|---|---|
+| LocalDB (default config) | ~150 msg/s | Reference baseline above |
+| LocalDB (BulkBookkeeping + no success attempts) | 500–800 msg/s | One round-trip per message dropped to ~one |
+| SQL Server Express (local SSD) | 1,500–2,500 msg/s | Real log writer; same box, no network |
+| SQL Server Standard / Enterprise (dedicated) | 3,000–5,000+ msg/s | Scales further with `MaxConcurrentDispatch`, connection pool |
+| Azure SQL Database (S3+, GP_Gen5_4+) | 1,000–4,000 msg/s | Sensitive to DTU/vCore tier; network RTT dominates p50 |
+
+The numbers above are projected from the per-message round-trip cost: with bookkeeping optimisations enabled, each message costs ~1 SELECT (skipped if `RecordHandlerAttempts=false`) + amortised batch-level write. Throughput then scales linearly with `MaxConcurrentDispatch` until either the database CPU/IO or the ASP.NET Core receive side becomes the bottleneck. Above ~50 dispatch concurrency, `EnableRetryOnFailure` is essentially mandatory — concurrent batch-lock and receive-side INSERTs can deadlock on the candidate index, and EF Core retries them transparently.
+
+For latency-sensitive workloads, the **min** column of the load test result is the meaningful number — it's the pipeline floor when the queue is not backed up. On real SQL Server with sub-millisecond network RTT, expect 30–80 ms end-to-end (HTTP receive → handler complete). Backlog-induced latency only appears when arrival rate exceeds drain rate; size `MaxConcurrentDispatch` so steady-state drain comfortably exceeds expected peak arrival rate.
+
 ## Project Structure
 
 ```
@@ -470,10 +603,7 @@ InboxNet/
 │   ├── InboxNet.Processor/           # Background dispatcher hosted service
 │   └── InboxNet.Providers/           # Built-in providers: Stripe, GitHub, Generic HMAC
 ├── tests/
-│   ├── InboxNet.Core.Tests/
-│   ├── InboxNet.Delivery.Tests/
-│   ├── InboxNet.LoadTests/
-│   └── InboxNet.Processor.Tests/
+│   └── InboxNet.LoadTests/          # End-to-end pipeline load test (webhook → handler)
 ├── samples/
 │   └── InboxNet.SampleApp/           # ASP.NET Core sample with Stripe, GitHub, Acme providers
 ├── Directory.Build.props             # Shared build + NuGet package properties

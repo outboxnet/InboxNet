@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -16,6 +17,18 @@ namespace InboxNet.Processor;
 /// disposition. Handlers are sequential (unlike the outbox's parallel subscription delivery)
 /// because inbox handlers often share a logical entity and ordering matters.
 /// </summary>
+/// <remarks>
+/// Three knobs on <see cref="InboxOptions"/> control the bookkeeping cost on the happy path:
+/// <list type="bullet">
+///   <item><see cref="InboxOptions.BulkBookkeeping"/> — flush attempts and processed-status
+///   updates once per batch instead of per message.</item>
+///   <item><see cref="InboxOptions.RecordAttemptsOnSuccess"/> — when false, only failures
+///   leave an attempt row.</item>
+///   <item><see cref="InboxOptions.RecordHandlerAttempts"/> — when false, skip the attempt
+///   store entirely (no SELECT, no INSERTs); handlers run on every dispatch and must be
+///   idempotent on <see cref="InboxMessage.Id"/>.</item>
+/// </list>
+/// </remarks>
 public sealed class InboxProcessingPipeline : IInboxProcessor
 {
     private readonly IServiceScopeFactory _scopeFactory;
@@ -79,6 +92,8 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
 
             _logger.LogInformation("Processing batch of {Count} inbox messages", messages.Count);
 
+            var bookkeeper = new BatchBookkeeper();
+
             await Parallel.ForEachAsync(
                 messages,
                 new ParallelOptions
@@ -95,8 +110,11 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
                         message,
                         lockedBy,
                         msp,
+                        bookkeeper,
                         token);
                 });
+
+            await FlushBatchAsync(bookkeeper, lockedBy, sp, ct);
 
             return messages.Count;
         }
@@ -126,7 +144,10 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
         if (message is null)
             return false;
 
-        await DispatchMessageAsync(message, lockedBy, sp, ct);
+        // Single-message path always flushes immediately — there's nothing to amortize over.
+        var bookkeeper = new BatchBookkeeper();
+        await DispatchMessageAsync(message, lockedBy, sp, bookkeeper, ct);
+        await FlushBatchAsync(bookkeeper, lockedBy, sp, ct);
         return true;
     }
 
@@ -136,15 +157,13 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
         InboxMessage message,
         string lockedBy,
         IServiceProvider sp,
+        BatchBookkeeper bookkeeper,
         CancellationToken ct)
     {
         using var activity = InboxActivitySource.Source.StartActivity("inbox.dispatch");
         activity?.SetTag("inbox.message_id", message.Id.ToString());
         activity?.SetTag("inbox.provider_key", message.ProviderKey);
         activity?.SetTag("inbox.event_type", message.EventType);
-
-        var store = sp.GetRequiredService<IInboxStore>();
-        var attemptStore = sp.GetRequiredService<IInboxHandlerAttemptStore>();
 
         var matching = _handlerRegistry.GetMatching(message.ProviderKey, message.EventType);
 
@@ -154,85 +173,201 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
                 "No handlers registered for provider {ProviderKey}, event {EventType} — marking message {MessageId} as processed",
                 message.ProviderKey, message.EventType, message.Id);
 
-            if (await store.MarkAsProcessedAsync(message.Id, lockedBy, ct))
-            {
-                InboxMetrics.MessagesProcessed.Add(1,
-                    new KeyValuePair<string, object?>("provider", message.ProviderKey),
-                    new KeyValuePair<string, object?>("event_type", message.EventType));
-            }
+            bookkeeper.AddSuccess(message);
             return;
         }
 
         IReadOnlyDictionary<string, HandlerAttemptState> states;
-        try
+        if (_options.RecordHandlerAttempts)
         {
-            var handlerNames = matching.Select(r => r.HandlerName).ToList();
-            states = await attemptStore.GetHandlerStatesAsync(message.Id, handlerNames, ct);
+            try
+            {
+                var attemptStore = sp.GetRequiredService<IInboxHandlerAttemptStore>();
+                var handlerNames = matching.Select(r => r.HandlerName).ToList();
+                states = await attemptStore.GetHandlerStatesAsync(message.Id, handlerNames, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Failed to fetch handler states for message {MessageId}", message.Id);
+                bookkeeper.AddFailure(message, ex.Message);
+                return;
+            }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        else
         {
-            _logger.LogError(ex, "Failed to fetch handler states for message {MessageId}", message.Id);
-            await HandleMessageFailureAsync(message, lockedBy, store, ex.Message, ct);
-            return;
+            // Attempt tracking disabled: pretend no prior attempts exist. Handlers re-run on
+            // every dispatch — this contract is documented on InboxOptions.RecordHandlerAttempts.
+            states = EmptyStates;
         }
 
         // ── DISPATCH PHASE ─────────────────────────────────────────────────────
         // Handlers run sequentially in registration order. If one fails we stop and let the
         // retry cycle pick up where we left off — successful handlers won't re-run because
         // their success records are persisted.
-
         var outcome = await RunHandlersAsync(message, matching, states, sp, ct);
 
         // ── BOOKKEEPING PHASE ──────────────────────────────────────────────────
-        if (outcome.NewAttempts.Count > 0)
+        // Filter attempts according to the configured policy before publishing into the
+        // bookkeeper. The flush stage is responsible for the actual round-trip.
+        if (_options.RecordHandlerAttempts && outcome.NewAttempts.Count > 0)
         {
-            var saved = await TrySaveAttemptsAsync(attemptStore, outcome.NewAttempts, message.Id, ct);
-
-            if (!saved && outcome.SuccessCount > 0)
+            foreach (var attempt in outcome.NewAttempts)
             {
-                // Attempts were lost. Don't increment retry — that would re-run successful handlers.
-                // Leave the lock to expire; another instance will retry after the visibility timeout.
-                _logger.LogCritical(
-                    "CRITICAL: Could not persist handler attempt records for message {MessageId}. " +
-                    "The message will be retried after lock expiry and handlers that succeeded MAY re-run. " +
-                    "Inbox handlers MUST be idempotent on InboxMessage.Id.",
-                    message.Id);
-                return;
+                var keep = attempt.Status != InboxHandlerStatus.Success
+                           || _options.RecordAttemptsOnSuccess;
+                if (keep) bookkeeper.Attempts.Add(attempt);
             }
         }
 
         // ── DECISION PHASE ─────────────────────────────────────────────────────
-        try
+        if (outcome.FailedCount == 0 && outcome.ExhaustedCount == 0)
         {
-            if (outcome.FailedCount == 0 && outcome.ExhaustedCount == 0)
+            bookkeeper.AddSuccess(message);
+        }
+        else if (outcome.FailedCount > 0)
+        {
+            bookkeeper.AddFailure(message, outcome.LastError ?? "One or more handlers failed");
+        }
+        else
+        {
+            // All remaining handlers are exhausted — dead-letter the message so it doesn't spin.
+            _logger.LogError(
+                "Message {MessageId}: {Exhausted} handler(s) exhausted retries — dead-lettering",
+                message.Id, outcome.ExhaustedCount);
+            bookkeeper.AddDeadLetter(message);
+        }
+    }
+
+    // ── Flush ─────────────────────────────────────────────────────────────────
+
+    private async Task FlushBatchAsync(
+        BatchBookkeeper bookkeeper,
+        string lockedBy,
+        IServiceProvider sp,
+        CancellationToken ct)
+    {
+        var store = sp.GetRequiredService<IInboxStore>();
+
+        // 1. Persist attempts. With BulkBookkeeping=true the SaveAttempts call is one INSERT
+        //    set; with BulkBookkeeping=false we partition by message and write each separately
+        //    so a partial failure only stalls one message's bookkeeping.
+        if (_options.RecordHandlerAttempts && bookkeeper.Attempts.Count > 0)
+        {
+            var attemptStore = sp.GetRequiredService<IInboxHandlerAttemptStore>();
+
+            // ConcurrentBag enumeration is snapshot-safe but we need a list for the store API.
+            var allAttempts = bookkeeper.Attempts.ToList();
+
+            if (_options.BulkBookkeeping)
             {
-                if (await store.MarkAsProcessedAsync(message.Id, lockedBy, ct))
+                if (!await TrySaveAttemptsAsync(attemptStore, allAttempts, ct))
                 {
-                    InboxMetrics.MessagesProcessed.Add(1,
-                        new KeyValuePair<string, object?>("provider", message.ProviderKey),
-                        new KeyValuePair<string, object?>("event_type", message.EventType));
+                    // Bulk attempt write failed. Treat every message that had a success as
+                    // "leave the lock to expire" — same invariant as the per-message path.
+                    var hasAnySuccess = allAttempts.Any(a => a.Status == InboxHandlerStatus.Success);
+                    if (hasAnySuccess)
+                    {
+                        _logger.LogCritical(
+                            "CRITICAL: Bulk attempt save failed for {Count} attempt(s). " +
+                            "Successful handlers MAY re-run after lock expiry — handlers MUST be " +
+                            "idempotent on InboxMessage.Id.",
+                            allAttempts.Count);
+                        return;
+                    }
                 }
-                else
-                {
-                    _logger.LogWarning(
-                        "Lock lost for message {MessageId} after successful dispatch " +
-                        "(success records saved — no re-dispatch will occur)",
-                        message.Id);
-                }
-            }
-            else if (outcome.FailedCount > 0)
-            {
-                await HandleMessageFailureAsync(
-                    message, lockedBy, store,
-                    outcome.LastError ?? "One or more handlers failed", ct);
             }
             else
             {
-                // All remaining handlers are exhausted — dead-letter the message so it doesn't spin.
-                _logger.LogError(
-                    "Message {MessageId}: {Exhausted} handler(s) exhausted retries — dead-lettering",
-                    message.Id, outcome.ExhaustedCount);
+                var byMessage = allAttempts.GroupBy(a => a.InboxMessageId);
+                foreach (var group in byMessage)
+                {
+                    var attempts = group.ToList();
+                    if (!await TrySaveAttemptsAsync(attemptStore, attempts, ct))
+                    {
+                        var hasSuccess = attempts.Any(a => a.Status == InboxHandlerStatus.Success);
+                        if (hasSuccess)
+                        {
+                            _logger.LogCritical(
+                                "CRITICAL: Could not persist handler attempt records for message {MessageId}. " +
+                                "The message will be retried after lock expiry and handlers that succeeded MAY re-run. " +
+                                "Inbox handlers MUST be idempotent on InboxMessage.Id.",
+                                group.Key);
+                            // Drop this message from the success list so we don't mark it processed.
+                            bookkeeper.SuppressSuccess(group.Key);
+                        }
+                    }
+                }
+            }
+        }
 
+        // 2. Mark successful messages as processed.
+        if (bookkeeper.SuccessIds.Count > 0)
+        {
+            try
+            {
+                if (_options.BulkBookkeeping)
+                {
+                    var ids = bookkeeper.SuccessIds.ToArray();
+                    var updated = await store.MarkAsProcessedBulkAsync(ids, lockedBy, ct);
+                    if (updated < ids.Length)
+                    {
+                        _logger.LogWarning(
+                            "Lock lost for {Lost}/{Total} message(s) during bulk mark-as-processed " +
+                            "(success records saved — no re-dispatch will occur).",
+                            ids.Length - updated, ids.Length);
+                    }
+                    foreach (var (provider, eventType) in bookkeeper.SuccessTags)
+                    {
+                        InboxMetrics.MessagesProcessed.Add(1,
+                            new KeyValuePair<string, object?>("provider", provider),
+                            new KeyValuePair<string, object?>("event_type", eventType));
+                    }
+                }
+                else
+                {
+                    foreach (var (id, provider, eventType) in bookkeeper.EnumerateSuccessRecords())
+                    {
+                        if (await store.MarkAsProcessedAsync(id, lockedBy, ct))
+                        {
+                            InboxMetrics.MessagesProcessed.Add(1,
+                                new KeyValuePair<string, object?>("provider", provider),
+                                new KeyValuePair<string, object?>("event_type", eventType));
+                        }
+                        else
+                        {
+                            _logger.LogWarning(
+                                "Lock lost for message {MessageId} after successful dispatch " +
+                                "(success records saved — no re-dispatch will occur)",
+                                id);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Error marking {Count} message(s) as processed", bookkeeper.SuccessIds.Count);
+            }
+        }
+
+        // 3. Per-message failure handling — each failure has its own retry schedule and
+        //    error string, so this can't be bulked the same way as success.
+        foreach (var (message, error) in bookkeeper.Failures)
+        {
+            try
+            {
+                await HandleMessageFailureAsync(message, lockedBy, store, error, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Error handling failure for message {MessageId}", message.Id);
+            }
+        }
+
+        // 4. Per-message dead-lettering — same reasoning as failure handling.
+        foreach (var message in bookkeeper.DeadLetters)
+        {
+            try
+            {
                 if (await store.MarkAsDeadLetteredAsync(message.Id, lockedBy, ct))
                 {
                     InboxMetrics.MessagesDeadLettered.Add(1,
@@ -246,14 +381,17 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
                         message.Id);
                 }
             }
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogError(ex, "Error updating message status for {MessageId}", message.Id);
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Error dead-lettering message {MessageId}", message.Id);
+            }
         }
     }
 
     // ── Sequential handler dispatch ───────────────────────────────────────────
+
+    private static readonly IReadOnlyDictionary<string, HandlerAttemptState> EmptyStates =
+        new Dictionary<string, HandlerAttemptState>();
 
     private sealed record DispatchOutcome(
         int SuccessCount,
@@ -374,8 +512,7 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
 
     private async Task<bool> TrySaveAttemptsAsync(
         IInboxHandlerAttemptStore store,
-        List<InboxHandlerAttempt> attempts,
-        Guid messageId,
+        IReadOnlyList<InboxHandlerAttempt> attempts,
         CancellationToken ct)
     {
         if (attempts.Count == 0) return true;
@@ -387,9 +524,7 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex,
-                "Failed to save {Count} handler attempt(s) for message {MessageId}",
-                attempts.Count, messageId);
+            _logger.LogError(ex, "Failed to save {Count} handler attempt(s)", attempts.Count);
             return false;
         }
     }
@@ -437,6 +572,90 @@ public sealed class InboxProcessingPipeline : IInboxProcessor
                 _logger.LogWarning(
                     "Lock lost for message {MessageId} during dead-letter handling",
                     message.Id);
+            }
+        }
+    }
+
+    // ── Bookkeeper ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Thread-safe staging buffer for the outcomes of a single dispatch batch. Per-message
+    /// dispatch publishes into this; the flush stage drains it.
+    /// </summary>
+    private sealed class BatchBookkeeper
+    {
+        public ConcurrentBag<InboxHandlerAttempt> Attempts { get; } = new();
+
+        // Ordered records preserved for the per-message flush path; the bulk path only needs
+        // the IDs and the metric tag tuples.
+        private readonly ConcurrentQueue<(Guid Id, string Provider, string EventType)> _successes = new();
+        private readonly HashSet<Guid> _suppressed = new();
+        private readonly object _suppressLock = new();
+
+        public ConcurrentBag<(InboxMessage Message, string Error)> Failures { get; } = new();
+        public ConcurrentBag<InboxMessage> DeadLetters { get; } = new();
+
+        public void AddSuccess(InboxMessage message) =>
+            _successes.Enqueue((message.Id, message.ProviderKey, message.EventType));
+
+        public void AddFailure(InboxMessage message, string error) =>
+            Failures.Add((message, error));
+
+        public void AddDeadLetter(InboxMessage message) =>
+            DeadLetters.Add(message);
+
+        /// <summary>
+        /// Marks a previously-recorded success as not-to-be-flushed. Used when an attempt
+        /// save failed for that message and we'd rather retry-via-lock-expiry than risk
+        /// double-dispatch.
+        /// </summary>
+        public void SuppressSuccess(Guid messageId)
+        {
+            lock (_suppressLock) _suppressed.Add(messageId);
+        }
+
+        public IReadOnlyCollection<Guid> SuccessIds
+        {
+            get
+            {
+                lock (_suppressLock)
+                {
+                    var ids = new List<Guid>(_successes.Count);
+                    foreach (var rec in _successes)
+                    {
+                        if (!_suppressed.Contains(rec.Id)) ids.Add(rec.Id);
+                    }
+                    return ids;
+                }
+            }
+        }
+
+        public IEnumerable<(string Provider, string EventType)> SuccessTags
+        {
+            get
+            {
+                lock (_suppressLock)
+                {
+                    var tags = new List<(string, string)>(_successes.Count);
+                    foreach (var rec in _successes)
+                    {
+                        if (!_suppressed.Contains(rec.Id)) tags.Add((rec.Provider, rec.EventType));
+                    }
+                    return tags;
+                }
+            }
+        }
+
+        public IEnumerable<(Guid Id, string Provider, string EventType)> EnumerateSuccessRecords()
+        {
+            lock (_suppressLock)
+            {
+                var list = new List<(Guid, string, string)>(_successes.Count);
+                foreach (var rec in _successes)
+                {
+                    if (!_suppressed.Contains(rec.Id)) list.Add(rec);
+                }
+                return list;
             }
         }
     }

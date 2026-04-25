@@ -226,6 +226,39 @@ internal sealed class EfCoreInboxStore : IInboxStore
         return affected > 0;
     }
 
+    public async Task<int> MarkAsProcessedBulkAsync(
+        IReadOnlyCollection<Guid> messageIds,
+        string lockedBy,
+        CancellationToken ct = default)
+    {
+        if (messageIds.Count == 0) return 0;
+
+        // OPENJSON keeps the plan stable regardless of batch size — a Contains() translation
+        // would emit IN (@p0, @p1, ...) and cache one plan per distinct id-count.
+        var schema = _options.SchemaName;
+        var idsJson = System.Text.Json.JsonSerializer.Serialize(messageIds);
+
+        var sql = $"""
+            UPDATE m
+            SET m.[Status]      = @processedStatus,
+                m.[ProcessedAt] = SYSDATETIMEOFFSET(),
+                m.[LockedUntil] = NULL,
+                m.[LockedBy]    = NULL
+            FROM [{schema}].[InboxMessages] m
+            INNER JOIN OPENJSON(@ids) WITH ([value] UNIQUEIDENTIFIER '$') AS j
+                    ON m.[Id] = j.[value]
+            WHERE m.[LockedBy] = @lockedBy
+            """;
+
+        return await _dbContext.Database.ExecuteSqlRawAsync(sql,
+            new[]
+            {
+                new SqlParameter("@processedStatus", SqlDbType.Int)              { Value = (int)InboxMessageStatus.Processed },
+                new SqlParameter("@lockedBy",        SqlDbType.NVarChar, 256)    { Value = lockedBy },
+                new SqlParameter("@ids",             SqlDbType.NVarChar, -1)     { Value = idsJson }
+            }, ct);
+    }
+
     public async Task<bool> IncrementRetryAsync(
         Guid messageId,
         string lockedBy,

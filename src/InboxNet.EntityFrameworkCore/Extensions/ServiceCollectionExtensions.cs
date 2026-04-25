@@ -28,6 +28,18 @@ public static class ServiceCollectionExtensions
             {
                 if (sqlOptions.MigrationsAssembly is not null)
                     sql.MigrationsAssembly(sqlOptions.MigrationsAssembly);
+
+                // EnableRetryOnFailure transparently retries SQL Server deadlocks (1205),
+                // connection drops, and other transient errors. Strongly recommended at
+                // dispatcher concurrency above ~50 — concurrent batch-lock UPDATEs and
+                // receive-side INSERTs can deadlock on the candidate index.
+                if (sqlOptions.EnableRetryOnFailure)
+                {
+                    sql.EnableRetryOnFailure(
+                        maxRetryCount: sqlOptions.MaxRetryCount,
+                        maxRetryDelay: sqlOptions.MaxRetryDelay,
+                        errorNumbersToAdd: null);
+                }
             });
         });
 
@@ -42,4 +54,17 @@ public static class ServiceCollectionExtensions
 public class EfCoreInboxSqlServerOptions
 {
     public string? MigrationsAssembly { get; set; }
+
+    /// <summary>
+    /// Enables EF Core's built-in transient-error retry. Catches SQL Server deadlocks
+    /// (error 1205) plus the standard set of connection / availability errors.
+    /// Default: <c>true</c>.
+    /// </summary>
+    public bool EnableRetryOnFailure { get; set; } = true;
+
+    /// <summary>Maximum retry attempts when <see cref="EnableRetryOnFailure"/> is true. Default: 5.</summary>
+    public int MaxRetryCount { get; set; } = 5;
+
+    /// <summary>Maximum delay between retries (exponential backoff up to this cap). Default: 5s.</summary>
+    public TimeSpan MaxRetryDelay { get; set; } = TimeSpan.FromSeconds(5);
 }
