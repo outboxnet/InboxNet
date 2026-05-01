@@ -9,12 +9,12 @@
 
     <!-- NuGet package metadata (shared across all src projects) -->
     <Version>1.0.0</Version>
-    <Authors>InboxNet Contributors</Authors>
-    <Company>InboxNet</Company>
-    <Copyright>Copyright (c) 2024 InboxNet Contributors</Copyright>
+    <Authors>Lőrinc Sándor</Authors>
+    <Company>Dragonfire</Company>
+    <Copyright>Copyright (c) Lőrinc Sándor</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/outboxnet/InboxNet</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/outboxnet/InboxNet.git</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/outboxnet/Dragonfire</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/outboxnet/Dragonfire.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>

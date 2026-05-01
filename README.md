@@ -1,5 +1,7 @@
 # InboxNet
 
+> **This package has moved.** The Dragonfire suite is now developed in a single repository: [`outboxnet/Dragonfire`](https://github.com/outboxnet/Dragonfire). Visit it for the latest version and the full suite of packages.
+
 [![CI](https://github.com/outboxnet/InboxNet/actions/workflows/ci.yml/badge.svg)](https://github.com/outboxnet/InboxNet/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/InboxNet.Core.svg)](https://www.nuget.org/packages/InboxNet.Core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
